@@ -1,0 +1,3389 @@
+//@version=5
+// ============================================================================
+// GPCombo v60.093  (Estratégia) — patch “zero erros/warnings”
+// - Limpeza de ADX (TR), saída forçada (IDs válidos) e remoção de espelhos/rascunhos não usados
+// - Demais funcionalidades mantidas
+// ============================================================================
+
+// === Versão (fonte única de verdade)  
+const string VERSION = "v60.093"
+
+strategy("GPCombo " + VERSION,
+     overlay=true,
+     initial_capital=50000,
+     currency=currency.NONE,
+     pyramiding=3,
+     commission_type=strategy.commission.cash_per_order, commission_value=0.0,
+     calc_on_every_tick=true, process_orders_on_close=false,
+     calc_on_order_fills=true,
+     slippage=0)
+var int _seqToday = 0
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+// === Helpers "no-ternary" (sem tuplas/sem ?:)
+choosef(bool c, float a, float b) =>
+    float r = b
+    if c
+        r := a
+    r
+
+// ADX "seguro": todas as ta.rma/ta.tr executadas em toda barra (sem condicionais)
+f_adx(int len) =>
+    float up      = math.max(high - high[1], 0.0)
+    float down    = math.max(low[1]  - low,  0.0)
+    float plusDM  = (up   > down) ? up   : 0.0
+    float minusDM = (down > up)   ? down : 0.0
+    float trSm    = ta.rma(ta.tr(true), len)
+    float pDMsm   = ta.rma(plusDM,  len)
+    float mDMsm   = ta.rma(minusDM, len)
+    float pDI     = trSm > 0 ? 100.0 * pDMsm / trSm : 0.0
+    float mDI     = trSm > 0 ? 100.0 * mDMsm / trSm : 0.0
+    float den     = pDI + mDI
+    float dx      = den  > 0 ? 100.0 * math.abs(pDI - mDI) / den : 0.0
+    ta.rma(dx, len)
+
+choosei(bool c, int a, int b) =>
+    int r = b
+    if c
+        r := a
+    r
+
+chooseb(bool c, bool a, bool b) =>
+    bool r = b
+    if c
+        r := a
+    r
+
+chooses(bool c, string a, string b) =>
+    string r = b
+    if c
+        r := a
+    r
+
+// Execução por modo (Intrabar vs Barra fechada) sem ternário
+exec_mode_ok(string m) =>
+    bool r = true
+    if m == "Barra fechada"
+        r := barstate.isconfirmed
+    r
+
+// GateMode → passa/nao-passa (Soft/Medium/Hard/Off) sem ternário
+pass_by_mode(string mode, bool softOk, bool medOk, bool hardOk) =>
+    bool r = softOk
+    if mode == "Medium"
+        r := medOk
+    if mode == "Hard"
+        r := hardOk
+    if mode == "Off"
+        r := true
+    r
+
+// Preço de referência dos TPs (AvgPrice/Close) sem ternário
+ref_price(string src, float avgPx, float cls, bool hasPos) =>
+    float r = cls
+    if src == "AvgPrice" and hasPos
+        r := avgPx
+    r
+
+clampf(float x, float lo, float hi) =>
+    float a = math.max(lo, x)
+    float b = math.min(a, hi)
+    b
+
+round_to_step(float qty, float step) =>
+    float st = step <= 0 ? 1.0 : step
+    float q  = qty / st
+    float qf = math.floor(q)
+    float r  = qf * st
+    r
+
+ceil_to_step(float qty, float step) =>
+    float st = step <= 0 ? 1.0 : step
+    float q  = qty / st
+    float qf = math.ceil(q)
+    float r  = qf * st
+    r
+
+nzf(float v, float repl) =>
+    float r = na(v) ? repl : v
+    r
+
+
+// aplica boosts respeitando passe e retornando já arredondado
+boost_qty(float q, float pct, float step) =>
+    round_to_step(q * (1.0 + pct/100.0), step)
+
+clockMs() => int(nz(timenow, time))
+
+// ---- Core allow flags (inicialização global segura)
+bool allowCoreL = true
+bool allowCoreS = true
+
+// Retorna true se o horário atual está entre HHMM início e HHMM fim (inclusivo)
+f_inHHMM(int startHHMM, int endHHMM) =>
+    int sh = int(math.floor(startHHMM / 100))
+    int sm = startHHMM % 100
+    int eh = int(math.floor(endHHMM / 100))
+    int em = endHHMM % 100
+    int nowM = hour(time) * 60 + minute(time)
+    int sM = sh*60 + sm
+    int eM = eh*60 + em
+    nowM >= sM and nowM <= eM
+
+// === Hora de envio real (BR) e Código único por envio ===
+f2(int n)=>str.format("{0,number,00}", n)
+f3(int n)=>str.format("{0,number,000}", n)
+f4(int n)=>str.format("{0,number,0000}", n)
+// HH-MM-SS (Brasil, São Paulo)
+hora_envio_br(int ms) =>
+    f2(hour(ms, "America/Sao_Paulo")) + "-" + f2(minute(ms, "America/Sao_Paulo")) + "-" +  f2(second(ms, "America/Sao_Paulo"))
+hora_hhmmss_from_ms(int ms)=> f2(hour(ms, "America/Sao_Paulo")) + f2(minute(ms, "America/Sao_Paulo")) + f2(second(ms, "America/Sao_Paulo"))
+date_key_from_ms(int ms)=> f2(dayofmonth(ms, "America/Sao_Paulo")) + f2(month(ms, "America/Sao_Paulo")) + f4(year(ms, "America/Sao_Paulo"))
+
+var int _lastSendMs = na
+
+build_code_from_ms(int ms) => syminfo.ticker + "-" + timeframe.period + "-" + date_key_from_ms(ms) + "-" + hora_hhmmss_from_ms(ms) + "-" + f3(_seqToday)
+
+mark_send() => clockMs()
+_lastSendMs := mark_send()
+
+exit_tipo(int sideEff) =>
+    string t = ""
+    if sideEff > 0
+        t := "venda"   // sair do long = vender
+    else
+        if sideEff < 0
+            t := "compra" // sair do short = comprar
+    t
+
+string gpHODv2 = "④.d HOD Control v2"
+bool  hod_use    = input.bool(false, "Usar perfil por hora-do-dia (v2)", group=gpHODv2)
+int   hod1_ini   = input.int(1000, "Janela 1: início (HHMM)", group=gpHODv2)
+int   hod1_fim   = input.int(1100, "Janela 1: fim (HHMM)", group=gpHODv2)
+string hod1_acao = input.string("Off", "Ação Janela 1", options=["Off","Block","Weight","Boost"], group=gpHODv2)
+int   hod2_ini   = input.int(1200, "Janela 2: início (HHMM)", group=gpHODv2)
+int   hod2_fim   = input.int(1400, "Janela 2: fim (HHMM)", group=gpHODv2)
+string hod2_acao = input.string("Off", "Ação Janela 2", options=["Off","Block","Weight","Boost"], group=gpHODv2)
+int   hod3_ini   = input.int(1600, "Janela 3: início (HHMM)", group=gpHODv2)
+int   hod3_fim   = input.int(1740, "Janela 3: fim (HHMM)", group=gpHODv2)
+string hod3_acao = input.string("Off", "Ação Janela 3", options=["Off","Block","Weight","Boost"], group=gpHODv2)
+float hod_weight_fraco = input.float(0.70, "Weight fator fraco", minval=0.0, step=0.05, group=gpHODv2)
+float hod_weight_forte = input.float(1.20, "Boost fator forte", minval=0.1, step=0.05, group=gpHODv2)
+bool  inH1 = hod_use and f_inHHMM(hod1_ini, hod1_fim)
+bool  inH2 = hod_use and f_inHHMM(hod2_ini, hod2_fim)
+bool  inH3 = hod_use and f_inHHMM(hod3_ini, hod3_fim)
+float hod_mult_now = 1.0
+bool  hod_block_now = false
+string hod_tag = "fora"
+if inH1
+    if hod1_acao == "Block"
+        hod_block_now := true
+    if hod1_acao == "Weight"
+        hod_mult_now := hod_mult_now * hod_weight_fraco
+    if hod1_acao == "Boost"
+        hod_mult_now := hod_mult_now * hod_weight_forte
+    hod_tag := "J1"
+if inH2
+    if hod2_acao == "Block"
+        hod_block_now := true
+    if hod2_acao == "Weight"
+        hod_mult_now := hod_mult_now * hod_weight_fraco
+    if hod2_acao == "Boost"
+        hod_mult_now := hod_mult_now * hod_weight_forte
+    hod_tag := "J2"
+if inH3
+    if hod3_acao == "Block"
+        hod_block_now := true
+    if hod3_acao == "Weight"
+        hod_mult_now := hod_mult_now * hod_weight_fraco
+    if hod3_acao == "Boost"
+        hod_mult_now := hod_mult_now * hod_weight_forte
+    hod_tag := "J3"
+
+
+// -----------------------------------------------------------------------------
+// ⓪ Modo / Sessão / Fechamento / Crypto
+// -----------------------------------------------------------------------------
+string gpMode = "⓪ Modo & Sessão"
+string opMode = input.string("Backtest", "Modo", options=["Backtest","Produção"], group=gpMode)
+bool   allowOrders = (opMode == "Backtest")
+
+bool   isCrypto = input.bool(false, "Ativo é Cripto?", group=gpMode)
+bool   cryptoIgnoreSession = input.bool(true, "Se Cripto: ignorar sessão/fechamento", group=gpMode)
+
+bool   useSession   = input.bool(true, "Restringir por sessão", group=gpMode)
+string sessMain     = input.session("1000-1740", "Sessão principal (HHMM-HHMM)", group=gpMode)
+bool   inSessionRaw = not useSession or not na(time(timeframe.period, sessMain))
+bool   inSession    = isCrypto and cryptoIgnoreSession ? true : inSessionRaw
+// Delay inicial pós-abertura da sessão
+bool useSessionDelay = input.bool(true, "Delay inicial pós-abertura", group=gpMode)
+int  sessionDelayMin = input.int(5, "Delay (min) após abrir sessão", minval=0, group=gpMode)
+// Detecta a virada "fora da sessão" -> "dentro da sessão"
+var int sessStartMs = na
+bool sessionJustOpened = inSessionRaw and not inSessionRaw[1]
+
+// Reseta no início de cada dia
+if ta.change(time("D")) != 0
+    sessStartMs := na
+
+// Marca o timestamp do primeiro candle da sessão
+if sessionJustOpened
+    sessStartMs := int(time)
+
+// Verifica se o delay já passou
+int  nowMs_all = int(time)
+int  needMs    = sessionDelayMin * 60 * 1000
+bool delayPassed = na(sessStartMs) ? false : (nowMs_all - sessStartMs) >= needMs
+
+// Se for cripto e estiver ignorando sessão, não aplica delay
+bool delayGate = isCrypto and cryptoIgnoreSession ? true
+                 : (not useSessionDelay ? true : delayPassed)
+// Fechamento (default 16:40) + Flat X min antes
+bool   useDayFlat   = input.bool(true, "Hard-Flat (zerar antes do fim)", group=gpMode)
+string mktCloseHHMM = input.string("1640", "Horário de fechamento (HHMM)", group=gpMode)
+
+// Parse HHMM seguro
+string _hhStr = str.substring(mktCloseHHMM, 0, 2)
+string _mmStr = str.substring(mktCloseHHMM, 2, 4)
+float  _hhF   = nz(str.tonumber(_hhStr), 16.0)
+float  _mmF   = nz(str.tonumber(_mmStr), 40.0)
+int    closeHH = int(math.floor(clampf(_hhF, 0.0, 23.0)))
+int    closeMM = int(math.floor(clampf(_mmF, 0.0, 59.0)))
+int    mktCloseMin  = closeHH * 60 + closeMM
+
+int    flatMinutes  = input.int(5, "Zerar a X min do fechamento", minval=0, group=gpMode)
+
+int    nowMinRaw    = hour(time) * 60 + minute(time)
+int    nowMin       = isCrypto and cryptoIgnoreSession ? 0 : nowMinRaw
+// Ajuste do cálculo (respeitar o toggle):
+bool timeToFlat = isCrypto and cryptoIgnoreSession ? false : (useDayFlat and ((mktCloseMin - nowMin) <= flatMinutes and (mktCloseMin - nowMin) >= 0))
+
+
+// === Alerta padronizado de força de saída (CUTOFF de sessão) ===
+bool useDayFlatAlert = true  // se quiser virar input depois
+
+// Se estiver no modo strategy e chegou a janela de flat, fecha de fato:
+if allowOrders and timeToFlat and strategy.position_size != 0
+    strategy.close_all("DayCutoff")
+
+// Uma entrada por barra (permitir nova já na barra seguinte)
+bool   sameBarEntries = input.bool(false, "Permitir múltiplas entradas na mesma barra", group=gpMode)
+var int lastEntryBar  = na
+// --- Gate: só 1 envio por barra (usa lastEntryBar que você já tem)
+bool canSendThisBar = sameBarEntries or na(lastEntryBar) or (bar_index > lastEntryBar)
+// =================== PATCH: guardião global 1-por-barra ===================
+bool onePerBar = input.bool(true, "Apenas 1 envio por barra (entradas/addons/alertas)", group=gpMode)
+
+// Estado global (último bar em que QUALQUER envio aconteceu: ordem/alerta/addon)
+var int lastSendBar = na
+
+// “Posso enviar algo agora?” — se ligado, apenas se ainda não enviei nada nesta barra
+bool canSendNow = onePerBar ? (na(lastSendBar) or bar_index > lastSendBar) : true
+
+// Compatibilidade: reutiliza o que já existia
+canSendThisBar := canSendNow
+// ========================================================================
+// Operar somente Long/Short/Ambos
+string sideMode = input.string("Both", "Lado permitido", options=["Both","LongOnly","ShortOnly"], group=gpMode)
+
+
+// Midday throttle (opcional)
+bool   useMidday    = input.bool(true, "Habilitar Midday", group=gpMode)
+string sessMid      = input.session("1200-1400", "Janela Midday (HHMM-HHMM)", group=gpMode)
+string midMode      = input.string("Throttle", "Midday: modo", options=["Off","Throttle","Block"], group=gpMode)
+float  midThrottle  = input.float(0.5, "Throttle fator (0-1)", minval=0.0, maxval=1.0, step=0.05, group=gpMode)
+bool   inMidday     = isCrypto and cryptoIgnoreSession ? false : (useMidday and not na(time(timeframe.period, sessMid)))
+// Midday dinâmico: se contexto forte, afrouxa; se fraco, estrangula mais
+float midAdj = 1.0
+
+// ①.b SoftKill e Janela Móvel
+string gpSoft = "①.b SoftKill & Rolling Window"
+bool useSoftKill = input.bool(true, "SoftKill por sequência de perdas", group=gpSoft)
+int  softKillLossStreak = input.int(2, "SoftKill: perdas seguidas ≥", minval=1, group=gpSoft)
+int  softKillPauseBars  = input.int(20, "SoftKill: pausar N barras", minval=1, group=gpSoft)
+bool useRollingLimit    = input.bool(false, "Limite por janela móvel", group=gpSoft)
+int  rollWindowMin      = input.int(30, "Janela (minutos)", minval=1, group=gpSoft)
+int  rollMaxTrades      = input.int(5,  "Máx trades na janela", minval=1, group=gpSoft)
+var  array<int> entryTimes = array.new_int()
+int  nowMs = int(time)
+int  winMs = rollWindowMin * 60 * 1000
+
+// ①.c Tilt diário (anti-tilt)
+string gpTilt = "①.c Tilt Diário"
+bool  tiltActive       = input.bool(false, "Ativar Tilt diário", group=gpTilt)
+string tilt_modo       = input.string("Reduzir size", "Ação", options=["Reduzir size","Bloquear novas entradas"], group=gpTilt)
+float tilt_sizeMult    = input.float(0.60, "Se reduzir: multiplicador", minval=0.1, maxval=1.0, step=0.05, group=gpTilt)
+int   tilt_lossTrigger = input.int(3, "Tilt: perdas seguidas (dia) ≥", minval=1, group=gpTilt)
+var   int tilt_lossStreakDay = 0
+bool  tiltTripNow = tiltActive and (tilt_lossStreakDay >= tilt_lossTrigger)
+
+// -----------------------------------------------------------------------------
+// ① Bases técnicas comuns
+// -----------------------------------------------------------------------------
+float atr14  = ta.atr(14)
+float ema200 = ta.ema(close, 200)
+float ema20  = ta.ema(close, 20)
+float vwap   = ta.vwap(hlc3)
+float pv     = math.max(1.0, syminfo.pointvalue)
+
+float volSMA20 = ta.sma(volume, 20)
+float rvol     = volSMA20 > 0 ? volume/volSMA20 : 1.0
+
+// === PATCH 4.A — VWAP2 (slope % por barra) — declarar ANTES de usar ===
+string gpV2Fix = "⑤.b.2 VWAP2 (slope %/bar)"
+bool  v2fix_use     = input.bool(false, "Usar slope do VWAP2 (%/bar)", group=gpV2Fix)
+int   v2fix_look    = input.int(5, "Lookback (barras)", minval=1, group=gpV2Fix)
+float v2fix_minPPB  = input.float(0.03, "Mín |slope| (% por barra)", minval=0.0, step=0.01, group=gpV2Fix)
+// Cálculo do slope: variação relativa do VWAP por barra (em %/bar)
+float v2_slopePPB   = na
+if not na(vwap[v2fix_look]) and vwap[v2fix_look] != 0
+    v2_slopePPB   := ((vwap - vwap[v2fix_look]) / vwap[v2fix_look]) * 100.0 / v2fix_look
+// Filtros de ok pra cima/baixo usando o slope (não mexe no seu okL/okS base)
+bool v2_okL_fix     = (close >= vwap) and (not na(v2_slopePPB) and v2_slopePPB >=  v2fix_minPPB)
+bool v2_okS_fix     = (close <= vwap) and (not na(v2_slopePPB) and v2_slopePPB <= -v2fix_minPPB)
+
+// === PATCH 5 — Núcleo da Reversão Inteligente v2 (histerese + cooldown) ===
+string gpRv2      = "④ Reversão Inteligente v2"
+bool   rv2_use    = input.bool(false, "Ativar reversão inteligente v2", group=gpRv2)
+float  rv2_minPP  = input.float(0.20, "Mín dist VWAP (%)", minval=0.0, step=0.05, group=gpRv2) / 100.0
+int    rv2_cool   = input.int(5, "Cooldown pós-reversão (barras)", minval=0, group=gpRv2)
+var    int rv2_last_rev_bar = na
+float  rv2_dist_up = (close - vwap) / vwap
+float  rv2_dist_dn = (vwap - close) / vwap
+bool   rv2_cool_ok = na(rv2_last_rev_bar) or (bar_index - rv2_last_rev_bar >= rv2_cool)
+// Tendência mínima via slope (cai para fallback VWAP caso v2fix_use=false)
+bool   m_trend_S = v2fix_use ? (not na(v2_slopePPB) and v2_slopePPB <= -v2fix_minPPB) : (close < vwap)
+bool   m_trend_L = v2fix_use ? (not na(v2_slopePPB) and v2_slopePPB >=  v2fix_minPPB) : (close > vwap)
+// MAPE: só reverter se houver posição oposta efetiva (evita "zig-zag" vazio)
+bool   m_mape_S  = (strategy.position_size > 0)
+bool   m_mape_L  = (strategy.position_size < 0)
+// Score simples (3 pontos): tendência + distância mínima + MAPE
+int    rv2_score_S = (m_trend_S ? 1 : 0) + (rv2_dist_dn >= rv2_minPP ? 1 : 0) + (m_mape_S ? 1 : 0)
+int    rv2_score_L = (m_trend_L ? 1 : 0) + (rv2_dist_up >= rv2_minPP ? 1 : 0) + (m_mape_L ? 1 : 0)
+bool   rv2_rev_to_S = rv2_use and rv2_cool_ok and rv2_score_S >= 3
+bool   rv2_rev_to_L = rv2_use and rv2_cool_ok and rv2_score_L >= 3
+bool   rv2_revert_now = rv2_rev_to_S or rv2_rev_to_L
+if rv2_revert_now
+    rv2_last_rev_bar := bar_index
+bool rev_use = rv2_use
+bool revOK_L = rv2_rev_to_L
+bool revOK_S = rv2_rev_to_S
+
+// -----------------------------------------------------------------------------
+// ② Risco & Limites — Fusão 55.007 + 59.003 + v60
+// -----------------------------------------------------------------------------
+string gpRisk = "① Risco & Limites (R$)"
+float riskBRL         = input.float(200.0, "Risco por trade (R$)", minval=1.0, step=10.0, group=gpRisk)
+float lotStep         = input.float(100.0, "Passo (múltiplos; aceita float ≤5 casas)", minval=0.00001, step=0.00001, group=gpRisk)
+int   tradesMaxDia    = input.int(3, "Máx trades/dia", minval=0, group=gpRisk)
+float maxDailyLossBRL = input.float(2000.0, "Perda máx. diária (R$) = HardKill", minval=0.0, step=50.0, group=gpRisk)
+float dailyKillBufferPct = input.float(0.0, "HardKill: buffer (%)", minval=0.0, maxval=3.0, step=0.1, group=gpRisk)
+int   cooldownBars    = input.int(0, "Cooldown entre entradas (barras)", minval=0, group=gpRisk)
+float maxQtyPerOrder  = input.float(50000.0, "Qtd máx por ordem (aceita float)", minval=0.00001, group=gpRisk)
+float minQtyPerTrade  = input.float(100.0, "Qtd mín por trade (aceita float)", minval=0.00001, group=gpRisk)
+bool  allowForceMinLot= input.bool(true, "Se base<passo: tentar 1 passo se risco tolerar", group=gpRisk)
+float maxOverRiskPct  = input.float(20.0, "Excesso de risco máx. p/ 1 passo (%)", minval=0.0, step=0.5, group=gpRisk)
+
+// Stop adicional por X×R (cash)
+bool  useXRiskStop    = input.bool(true, "Stop adicional por X×R (cash)", group=gpRisk)
+float xRiskMult       = input.float(2.5,  "X (ex.: 2.5 × risco)", minval=0.5, step=0.1, group=gpRisk)
+
+
+// Ganho mínimo e RR mínimo projetados (guard-rails para elevar $/trade)
+bool  mg_use              = input.bool(true,  "Exigir ganho previsto mínimo (R$)", group=gpRisk)
+float mg_minGain          = input.float(120.0,"Ganho previsto mínimo (R$)", step=5.0, group=gpRisk)
+bool  rr_use              = input.bool(true,  "Exigir RR mínimo projetado (TP1/STOP)", group=gpRisk)
+float rr_min              = input.float(1.20, "RR mínimo (TP1 ÷ STOP)", step=0.05, minval=0.5, group=gpRisk)
+
+// contadores do dia / PnL do dia 
+var float dayStartNet = na
+if na(dayStartNet) or ta.change(time("D")) != 0
+    dayStartNet := strategy.netprofit
+
+float profitToday = na(dayStartNet) ? 0.0 : (strategy.netprofit - dayStartNet)
+
+// Trades por dia
+var int tradesToday = 0
+if ta.change(time("D")) != 0
+    tradesToday := 0
+
+// HardKill diário (perda máx.)
+var bool dayKilled = false
+if ta.change(time("D")) != 0
+    dayKilled := false
+if maxDailyLossBRL > 0 and not dayKilled
+    float killLine = -maxDailyLossBRL * (1.0 - dailyKillBufferPct/100.0)
+    if profitToday <= killLine
+        strategy.close_all("DailyHardKill")
+        dayKilled := true
+
+// SoftKill por sequência de perdas (pausa temporária)
+var int lastWinTrades = 0
+var int lastLosTrades = 0
+var int lossStreak    = 0
+var int softPauseUntilBar = na
+// SoftKill adaptativo por regime (mais vol → pausa um pouco maior)
+// usar ATR% local aqui para não depender dos Gates
+float _atrPctNow = (atr14/close)*100.0
+int   softPauseDyn = math.round(softKillPauseBars * (1 + clampf(_atrPctNow/2.0, 0.0, 2.0)))
+
+bool inSoftPause = not na(softPauseUntilBar) and bar_index <= softPauseUntilBar
+
+
+// === EVENTO ÚNICO DE FECHO DE TRADE ===
+bool evWin  = strategy.wintrades  != lastWinTrades
+bool evLoss = strategy.losstrades != lastLosTrades
+
+// SoftKill
+if evWin
+    lossStreak := 0
+if evLoss
+    lossStreak := lossStreak + 1
+    if useSoftKill and lossStreak >= softKillLossStreak
+        softPauseUntilBar := bar_index + softPauseDyn
+
+// Tilt diário
+if evWin
+    tilt_lossStreakDay := 0
+if evLoss
+    tilt_lossStreakDay := tilt_lossStreakDay + 1
+
+// Atualiza memórias UMA vez
+if evWin
+    lastWinTrades := strategy.wintrades
+if evLoss
+    lastLosTrades := strategy.losstrades
+
+f_prune_window() =>
+    int sz = array.size(entryTimes)
+    if sz > 0
+        for k = 0 to (sz - 1)
+            int i = (sz - 1) - k
+            int t = array.get(entryTimes, i)
+            if nowMs - t > winMs
+                array.remove(entryTimes, i)
+
+f_prune_window()
+int tradesInWindow = array.size(entryTimes)
+bool overRolling   = useRollingLimit and (tradesInWindow >= rollMaxTrades)
+
+// Cooldown entre entradas (em barras)
+bool inCooldown    = cooldownBars > 0 and not na(lastEntryBar) and (bar_index - lastEntryBar) <= cooldownBars
+bool hitMaxLoss    = dayKilled
+bool overDayTrades = tradesMaxDia > 0 and tradesToday >= tradesMaxDia
+
+// -----------------------------------------------------------------------------
+// ③ STOP / TP / BE / Trail + MinHold para evitar same-bar exits
+// -----------------------------------------------------------------------------
+string gpExit = "② Saídas (STOP/TP/BE/Trail)"
+// STOP base
+string sLMode = input.string("ATR", "Modo STOP", options=["ATR","Ticks","Percent","Fixo"], group=gpExit)
+float sLATRx  = input.float(1.0,  "ATRx p/ STOP", minval=0.05, step=0.05, group=gpExit)
+int   sLTicks = input.int(50,     "STOP em ticks", minval=1, group=gpExit)
+float sLPct   = input.float(1.0,  "STOP %", minval=0.05, step=0.05, group=gpExit)
+float sLFixed = input.float(50.0, "STOP FIXO (R$ por ação)", minval=0.01, step=0.01, group=gpExit)
+
+float stopDistPriceATR   = atr14 * sLATRx
+float stopDistPriceTicks = syminfo.mintick * sLTicks
+float stopDistPricePct   = close * (sLPct/100.0)
+float stopDistPriceFixo  = sLFixed / pv
+float stopDistPriceBase  = sLMode=="ATR" ? stopDistPriceATR : sLMode=="Ticks" ? stopDistPriceTicks : sLMode=="Percent" ? stopDistPricePct : stopDistPriceFixo
+float stopDistCashBase   = stopDistPriceBase * pv
+
+// TP / Execuções — padrão mais conservador (para evitar "mesmo horário")
+bool  useTP1      = input.bool(true,  "Usar TP1", group=gpExit)
+int   tp1Percent  = input.int(50,     "Percentual TP1 (%)", minval=0, maxval=100, group=gpExit)
+bool  useTP2      = input.bool(false, "Usar TP2 (restante)", group=gpExit)
+float tp1R_base   = input.float(1.2,  "TP1 base (R) [v60 ↑]", minval=0.1, step=0.1, group=gpExit)
+float tp1FloorR   = input.float(1.0,  "TP1 floor (R) [v60 ↑]", minval=0.5, step=0.05, group=gpExit)
+float tp1CeilR    = input.float(4.0,  "TP1 ceil (R)",  minval=0.5, step=0.1, group=gpExit)
+// [PATCH-2] Versão efetiva do R (pode ser ajustada em runtime; o input não pode)
+var float tp1R_base_eff = na
+tp1R_base_eff := tp1R_base
+bool  tp1AnchorEMA= input.bool(true,  "TP1 ancorar EMA200", group=gpExit)
+bool  tp1AnchorDon= input.bool(true,  "TP1 ancorar Donchian", group=gpExit)
+int   donLenTP    = input.int(20,     "Donchian (âncora TP1)", minval=2, group=gpExit)
+float tp2Mult     = input.float(2.0,  "TP2 = múltiplo de TP1", minval=1.0, step=0.25, group=gpExit)
+string tpRefSrc   = input.string("AvgPrice", "Preço ref. dos TPs", options=["AvgPrice","Close"], group=gpExit)
+
+// Exec modes (default mais confiável)
+string execTP1Mode   = input.string("Barra fechada", "Exec TP1", options=["Intrabar","Barra fechada"], group=gpExit)
+string execBEMode    = input.string("Barra fechada", "Exec Break-even", options=["Intrabar","Barra fechada"], group=gpExit)
+string execTrailMode = input.string("Barra fechada", "Exec Trail", options=["Intrabar","Barra fechada"], group=gpExit)
+string execStopMode  = input.string("Barra fechada", "Exec Stop", options=["Intrabar","Barra fechada"], group=gpExit)
+string execEntryMode   = input.string("Intrabar",      "Exec Entrada",     options=["Intrabar","Barra fechada"], group=gpExit)
+string execMaintMode   = input.string("Barra fechada", "Exec Manutenção",  options=["Intrabar","Barra fechada"], group=gpExit)
+string execCutoffMode  = input.string("Barra fechada", "Exec DayCutoff",   options=["Intrabar","Barra fechada"], group=gpExit)
+
+bool okEntryExec  = exec_mode_ok(execEntryMode)
+bool okMaintExec  = exec_mode_ok(execMaintMode)
+bool okCutoffExec = exec_mode_ok(execCutoffMode)
+bool okTP1Exec   = exec_mode_ok(execTP1Mode)
+bool okBEExec    = exec_mode_ok(execBEMode)
+bool okTrailExec = exec_mode_ok(execTrailMode)
+bool okStopExec  = exec_mode_ok(execStopMode)
+
+// ②.b BE/Trail — configs e estado COMPARTILHADOS (PRÉ-DECLARADOS AQUI) 
+bool  beOnlyAfterTP1 = input.bool(true,  "BE/Trail só após TP1", group=gpExit)
+bool  allowSameBarBE = input.bool(true,  "Permitir BE/Trail na mesma barra do TP1", group=gpExit)
+float beOffsetATRx   = input.float(0.0,  "Offset extra p/ BE (ATRx)", minval=0.0, step=0.05, group=gpExit)
+float trailATRx      = input.float(0.6,  "Trail offset (ATRx)",      minval=0.1, step=0.1,  group=gpExit)
+
+// Estado compartilhado por Runner e Alertas de BE/Trail (precisa existir antes das mensagens/runner)
+var float be_lastTrailPx = na
+var int   lastBEAlertBar = -1
+
+// ===== PATCH: Inputs extras (② Saídas) =====
+string gpExitX = gpExit
+
+// Modo Runner após TP2 (alonga alvo; fecha por STOP/trail)
+bool  extend_after_tp2 = input.bool(false, "TP2: alongar e travar stop em TP2 (Runner)", group=gpExitX)
+
+// Flat-Lock anti-eco: silenciar eventos por N barras após fechar
+bool  flatlock_enable  = input.bool(true,  "Flat-Lock: silenciar após fechar", group=gpExitX)
+int   flatlock_bars    = input.int(1,      "Flat-Lock: N barras de silêncio", minval=1, group=gpExitX)
+
+// === FLAT-LOCK (anti-eco de alertas) ===
+var int  _flatLockUntilBar = -1
+bool flatLocked = flatlock_enable and (bar_index <= _flatLockUntilBar)
+// reset diário OU ao abrir nova posição
+if ta.change(time("D")) != 0 or (strategy.position_size != 0 and strategy.position_size[1] == 0)
+    _flatLockUntilBar := -1
+// armar lock quando volta para flat (encerrou posição)
+if strategy.position_size == 0 and strategy.position_size[1] != 0 and flatlock_enable
+    _flatLockUntilBar := bar_index + flatlock_bars
+
+// === Memórias anti-duplicação por barra (TP/TP2/STOP) ===
+var int lastTp1AlertBarL  = -1
+var int lastTp1AlertBarS  = -1
+var int lastTp2AlertBarL  = -1
+var int lastTp2AlertBarS  = -1
+var int lastStopAlertBarL = -1
+var int lastStopAlertBarS = -1
+
+// BE/Trail: permitir exceção ao '1×/barra' na mesma barra do TP1
+
+// MinHold / evitar saída na mesma barra que a entrada
+int   minHoldBars     = input.int(1,  "MinHold: segurar pelo menos N barras", minval=0, group=gpExit)
+bool  holdAffectsStop = input.bool(false, "MinHold também trava STOP? (cautela)", group=gpExit)
+
+int maintainDelayMs  = 120 * 1000
+// --- MEMÓRIA DA POSIÇÃO EFETIVA (usada no modo Indicador/Alertas) ---
+var float  _entryAvg  = na
+var bool   _sentEntry = false
+var int    _entryMs   = na
+var float  _entryQty  = na
+var string _entrySide = ""
+var int posEntryBar = na
+
+// memória para alerta de manutenção (mantém entre barras)
+var bool _sentMaint = false
+
+// --- Sequencial diário + helpers de data/código (para 'codigo' no JSON)
+var string _curCode = ""
+date_key()=>f2(dayofmonth(time))+f2(month(time))+f4(year(time))
+hora_hhmmss()=>f2(hour(time,"America/Sao_Paulo"))+f2(minute(time,"America/Sao_Paulo"))+f2(second(time,"America/Sao_Paulo"))
+build_code()=> syminfo.ticker + "-" + timeframe.period + "-" + date_key() + "-" + hora_hhmmss() + "-" + f3(_seqToday)
+
+
+// --- Auto-reset defensivo quando sair da sessão ou no flat do fim do dia (modo Indicador)
+bool _autoFlat = (not allowOrders) and ((not inSession) or timeToFlat) and _sentEntry
+
+if _autoFlat and flatlock_enable
+    _flatLockUntilBar := bar_index + flatlock_bars
+
+if _autoFlat and strategy.position_size != 0
+    strategy.close("ForceClose", comment="Cutoff Auto Close")
+    alert("CUTOFF executado — posição encerrada automaticamente", alert.freq_once_per_bar)
+
+if _autoFlat and _sentEntry
+    _sentEntry:=false
+    _sentMaint:=false
+    _entryMs:=na
+    _entryQty:=na
+    _entryAvg:=na
+    _entrySide:=""
+    _curCode:=""
+
+// Opcional: controle fino do reset de manutenção
+var int _lastSide = 0
+
+bool inPosEffNow = allowOrders
+     ? (strategy.position_size != 0)
+     : (_sentEntry and _entryQty > 0 and not na(_entryAvg))
+
+if not inPosEffNow
+    posEntryBar := na
+
+bool allowExitNow = na(posEntryBar) ? true : (bar_index - posEntryBar) >= minHoldBars
+bool okStopFinal  = okStopExec
+if holdAffectsStop and not allowExitNow
+    okStopFinal := false
+bool okTPBEFinal  = allowExitNow
+
+// TP1 adaptativo (RSI/ATR%/RVOL + âncoras)
+tp1R_calc(float baseR) =>
+    float rsiNow_   = ta.rsi(close, 14)
+    float atrPctNow = (atr14/close)*100.0
+    float _smaVol20 = ta.sma(volume, 20)
+    float rvolNow   = _smaVol20 > 0 ? (volume / _smaVol20) : 1.0
+    float factor = 1.0
+    factor += (math.abs(rsiNow_ - 50.0)/100.0) * 0.6
+    factor += math.min(atrPctNow/2.0, 1.0) * 0.4
+    factor += math.min(math.max(rvolNow - 1.0, 0.0), 1.0) * 0.3
+    if tp1AnchorEMA
+        factor *= 1.0 + (math.abs(close - ema200) / math.max(close, syminfo.mintick*10))
+    if tp1AnchorDon
+        float dH = ta.highest(high, donLenTP)
+        float dL = ta.lowest(low,  donLenTP)
+        float distDon = math.min(math.abs(close - dH), math.abs(close - dL))
+        factor *= 1.0 + distDon * 0.2
+    // ajuste suave conforme o regime
+    float baserlocal = baseR
+    if atrPctNow > 1.5
+        baserlocal += 0.1
+    if rvolNow > 1.5
+        baserlocal += 0.05
+    float cr = clampf(baseR*factor, tp1FloorR, tp1CeilR)
+    cr
+
+getTP1Price(bool isLong, float basePx) =>
+    float rCash = stopDistCashBase
+    float t1R   = tp1R_calc(tp1R_base_eff)
+    float dist  = t1R * (rCash / pv)
+    float px    = isLong ? (basePx + dist) : (basePx - dist)
+    px
+
+getTP2Price(bool isLong, float basePx) =>
+    float rCash = stopDistCashBase
+    float t1R   = tp1R_calc(tp1R_base_eff)
+    float t2R   = math.max(tp2Mult * t1R, t1R + 0.5)
+    float dist  = t2R * (rCash / pv)
+    float px    = isLong ? (basePx + dist) : (basePx - dist)
+    px
+
+// === Trend tag sem ternário (usa ema200 já calculada) ===
+trend_tag_from(float emaNow, float emaPrev) =>
+    string t = "flat"
+    if emaNow > emaPrev
+        t := "up"
+    else
+        if emaNow < emaPrev
+            t := "down"
+    t
+
+trend_tag() =>
+    trend_tag_from(ema200, ema200[5])
+// Projeções para guard-rails (RR e minGain) — serão usadas no sizer
+float basePxProj = close
+float tp1ProjL = getTP1Price(true,  basePxProj)
+float tp2ProjL = useTP2 ? getTP2Price(true,  basePxProj) : na
+float tp1ProjS = getTP1Price(false, basePxProj)
+float tp2ProjS = useTP2 ? getTP2Price(false, basePxProj) : na
+// RR projetado (TP1 vs STOP base em cash)
+float _t1R_now = tp1R_calc(tp1R_base_eff)
+float rrProj = na
+if stopDistCashBase > 0
+    rrProj := _t1R_now
+// rrProj fica igual ao t1R_calc(base), mas mantemos a forma geral se futuramente o STOP base variar.
+bool rrOK = (not rr_use) or (not na(rrProj) and rrProj >= rr_min)
+// Preparos diversos para blocos seguintes
+var bool __ready_block1 = true
+// -----------------------------------------------------------------------------
+// ④ Métodos de Entrada (setup signals)
+// -----------------------------------------------------------------------------
+string gpMeth = "③ Métodos de Entrada"
+bool  avoidChop  = input.bool(true,  "Evitar lateralização nos breakouts", group=gpMeth)
+float chopTight  = input.float(55.0, "Choppiness limite (≤ entra)", minval=0, maxval=100, step=0.5, group=gpMeth)
+// Inside
+bool mInside_on = input.bool(true, "Inside Breakout", group=gpMeth)
+bool insidePrev = high[1] <= high[2] and low[1] >= low[2]
+bool sigInsideL = mInside_on and insidePrev and ta.crossover(close, high[1])
+bool sigInsideS = mInside_on and insidePrev and ta.crossunder(close, low[1])
+// Engulfing
+bool mEngulf_on = input.bool(true, "Engulfing", group=gpMeth)
+bool bullEng = close > open and open <= close[1] and close >= open[1] and low <= low[1] and high >= high[1]
+bool bearEng = close < open and open >= close[1] and close <= open[1] and low <= low[1] and high >= high[1]
+bool sigEngulfL = mEngulf_on and bullEng
+bool sigEngulfS = mEngulf_on and bearEng
+// Donchian
+bool mDon_on = input.bool(true, "Donchian Break", group=gpMeth)
+int  donLen = input.int(20, "Donchian len", minval=2, group=gpMeth)
+bool sigDonL = mDon_on and ta.crossover(close, ta.highest(high, donLen)[1])
+bool sigDonS = mDon_on and ta.crossunder(close, ta.lowest(low,  donLen)[1])
+
+// EMA Continuation
+bool  mCont_on = input.bool(true, "EMA Continuation", group=gpMeth)
+bool  sigContL = mCont_on and close > ema20 and low  <= ema20 and close > close[1]
+bool  sigContS = mCont_on and close < ema20 and high >= ema20 and close < close[1]
+// VWAP Reversal
+bool mVWAP_on = input.bool(false, "VWAP Reversal", group=gpMeth)
+float distVWAP = close - vwap
+bool sigVWAPL = mVWAP_on and distVWAP < 0 and ta.crossover(close, vwap)
+bool sigVWAPS = mVWAP_on and distVWAP > 0 and ta.crossunder(close, vwap)
+// Opening range
+bool mOR_on = input.bool(false, "Opening Range BO", group=gpMeth)
+int  orBars = input.int(5, "OR barras iniciais", minval=1, group=gpMeth)
+float orHigh = ta.highest(high, orBars)
+float orLow  = ta.lowest(low,  orBars)
+bool sigORL = mOR_on and bar_index > orBars and ta.crossover(close, orHigh)
+bool sigORS = mOR_on and bar_index > orBars and ta.crossunder(close, orLow)
+// RSI Divergência
+bool  mRSIDiv_on = input.bool(false, "RSI Divergência", group=gpMeth)
+int   divLen = input.int(14, "RSI div len", minval=5, group=gpMeth)
+float rsi = ta.rsi(close, 14)
+bool  bullDiv = mRSIDiv_on and low < low[1] and rsi > rsi[1] and low == ta.lowest(low, divLen)
+bool  bearDiv = mRSIDiv_on and high > high[1] and rsi < rsi[1] and high == ta.highest(high, divLen)
+bool  sigRSIL = bullDiv
+bool  sigRSIS = bearDiv
+// Range + Reteste (caixa)
+bool  mRangeRet_on = input.bool(false, "Range + Reteste (Caixa)", group=gpMeth)
+int   boxLen = input.int(30, "Box janela", minval=5, group=gpMeth)
+float boxH = ta.highest(high, boxLen)
+float boxL = ta.lowest(low,  boxLen)
+bool  boUp = ta.crossover(close, boxH[1])
+bool  boDn = ta.crossunder(close, boxL[1])
+var float boxBrkL = na
+var float boxBrkS = na
+if boUp
+    boxBrkL := boxH[1]
+if boDn
+    boxBrkS := boxL[1]
+float retTol = input.float(0.3, "Reteste tolerância (ATRx)", minval=0.0, step=0.05, group=gpMeth)
+bool  retBoxL = not na(boxBrkL) and math.abs(close - boxBrkL) <= retTol*atr14
+bool  retBoxS = not na(boxBrkS) and math.abs(close - boxBrkS) <= retTol*atr14
+bool  sigRangeRetL = mRangeRet_on and retBoxL
+bool  sigRangeRetS = mRangeRet_on and retBoxS
+// Breakout-Pullback local (BOPB)
+bool  mBOPB_on = input.bool(false, "Breakout-Pullback (local)", group=gpMeth)
+int   pivLen = input.int(3, "Pivô len", minval=1, group=gpMeth)
+float pH = ta.pivothigh(high, pivLen, pivLen)
+float pL = ta.pivotlow(low,  pivLen, pivLen)
+bool  brkPH = not na(pH[1]) and close > pH[1]
+bool  brkPL = not na(pL[1]) and close < pL[1]
+var float bopbLvlL = na
+var float bopbLvlS = na
+if brkPH
+    bopbLvlL := pH[1]
+if brkPL
+    bopbLvlS := pL[1]
+int   bopbBars = input.int(6, "Máx barras p/ pullback", minval=1, group=gpMeth)
+int   sincePH = ta.barssince(brkPH)
+int   sincePL = ta.barssince(brkPL)
+bool  pullL = sincePH <= bopbBars and not na(bopbLvlL) and math.abs(close - bopbLvlL) <= retTol*atr14
+bool  pullS = sincePL <= bopbBars and not na(bopbLvlS) and math.abs(close - bopbLvlS) <= retTol*atr14
+bool  sigBOPBL = mBOPB_on and pullL
+bool  sigBOPBS = mBOPB_on and pullS
+// Larry Williams 9.6 (aprox.)
+bool mLW96_on = input.bool(false, "Larry Williams 9.6 (aprox.)", group=gpMeth)
+int  lwStartBars = input.int(9, "Bars após abertura", minval=1, group=gpMeth)
+int  lwLook = input.int(6, "Janela gatilho", minval=1, group=gpMeth)
+bool inFirstHour = not na(time(timeframe.period, "1000-1100"))
+bool lwLong  = mLW96_on and inFirstHour and bar_index > lwStartBars and close > ta.highest(high, lwLook)[1]
+bool lwShort = mLW96_on and inFirstHour and bar_index > lwStartBars and close < ta.lowest(low,  lwLook)[1]
+bool sigLW96L = lwLong
+bool sigLW96S = lwShort
+// Opening Reversal Fade
+bool mORFade_on = input.bool(false, "Opening Reversal Fade", group=gpMeth)
+float orMid = (orHigh + orLow)/2.0
+bool  early = not na(time(timeframe.period, "1000-1100"))
+bool  sigORFadeL = mORFade_on and early and close < orLow and ta.crossover(close, vwap)
+bool  sigORFadeS = mORFade_on and early and close > orHigh and ta.crossunder(close, vwap)
+// 2-Bar
+bool m2Bar_on = input.bool(false, "2-Bar Reversal / Piercing / DarkCloud", group=gpMeth)
+bool bull2Bar = m2Bar_on and close[1] < open[1] and close > open and close >= (open[1] + close[1]) / 2.0 and low <= low[1]
+bool bear2Bar = m2Bar_on and close[1] > open[1] and close < open and close <= (open[1] + close[1]) / 2.0 and high >= high[1]
+bool sig2BarL = bull2Bar
+bool sig2BarS = bear2Bar
+// BOS Continuação
+bool mBOSCont_on = input.bool(false, "BOS Continuação (pós-reteste)", group=gpMeth)
+bool momentumL = close > open and close > high[1]
+bool momentumS = close < open and close < low[1]
+string gpBOSF = "③.c BOSCont Smart Filter"
+int   bos_trendWin = input.int(5, "Estrutura: janela pivôs (5=default)", minval=3, group=gpBOSF)
+float bos_flowATR  = input.float(0.80, "Fluxo: Range ≥ X×ATR", minval=0.1, step=0.05, group=gpBOSF)
+bool  bos_usePerf  = input.bool(true, "Punir falhas no dia (≥2 ignora 1 tentativa)", group=gpBOSF)
+float bos_volBoost = input.float(1.50, "Ignora punição se RVOL ≥", minval=1.0, step=0.1, group=gpBOSF)
+bool  bos_trendOKL = ta.highest(close, bos_trendWin) > ta.highest(close[bos_trendWin], bos_trendWin)
+bool  bos_trendOKS = ta.lowest(close,  bos_trendWin) < ta.lowest(close[bos_trendWin],  bos_trendWin)
+float _rng = high - low
+bool  bos_flowOKL  = (_rng >= bos_flowATR*atr14) and close >= (low + (high-low)*0.66)
+bool  bos_flowOKS  = (_rng >= bos_flowATR*atr14) and close <= (low + (high-low)*0.33)
+var int bos_failDay = 0
+if ta.change(time("D")) != 0
+    bos_failDay := 0
+bool bos_punish = bos_usePerf and (bos_failDay >= 2) and (rvol < bos_volBoost)
+bool sigBOSContL = mBOSCont_on and bos_trendOKL and bos_flowOKL and not bos_punish
+bool sigBOSContS = mBOSCont_on and bos_trendOKS and bos_flowOKS and not bos_punish
+
+// === NOVOS MÉTODOS v60.090 ===
+bool mADX_on   = input.bool(false, "ADX Compression Breakout", group=gpMeth)
+int  adxLen    = input.int(14, "ADX len", minval=5, group=gpMeth)
+float adxV = f_adx(adxLen)
+// versão robusta (evita igualdade estrita):
+bool adxCompress = (adxV < 15) and (adxV <= ta.lowest(adxV, adxLen*2))
+bool sigADXL = mADX_on and adxCompress and ta.crossover(close, ta.highest(high, 10)[1])
+bool sigADXS = mADX_on and adxCompress and ta.crossunder(close, ta.lowest(low,  10)[1])
+
+bool mRSIFS_on = input.bool(false, "RSI Failure Swing", group=gpMeth)
+float rsi14    = rsi
+
+bool mConflu_on = input.bool(false, "EMA–VWAP Confluence PB", group=gpMeth)
+// RSI Failure Swing (ajuste leve)
+bool rsiFS_L = mRSIFS_on and rsi14[2] < 30 and rsi14[1] > rsi14[2] and (rsi14 > 45 or ta.crossover(rsi14, 50)) and close >= high[1]
+bool rsiFS_S = mRSIFS_on and rsi14[2] > 70 and rsi14[1] < rsi14[2] and (rsi14 < 55 or ta.crossunder(rsi14, 50)) and close <= low[1]
+bool sigRSIFL = rsiFS_L
+bool sigRSIFS = rsiFS_S
+// EMA–VWAP Confluence PB (ajuste leve)
+bool conflL = mConflu_on and close >= vwap and low <= ema20 * 1.001 and ta.crossover(close, ema20)
+bool conflS = mConflu_on and close <= vwap and high >= ema20 * 0.999 and ta.crossunder(close, ema20)
+bool sigConfluL = conflL
+bool sigConfluS = conflS
+
+bool mATRexp_on = input.bool(false, "ATR Expansion Bar", group=gpMeth)
+bool bigBarL = mATRexp_on and (high - low) > 1.5*atr14 and close > open and close > (open + (high - low)*0.6)
+bool bigBarS = mATRexp_on and (high - low) > 1.5*atr14 and close < open and close < (open - (high - low)*0.6)
+bool sigATRXL = bigBarL
+bool sigATRXS = bigBarS
+// -----------------------------------------------------------------------------
+// ⑤ Gates & Filtros
+// -----------------------------------------------------------------------------
+string gpFilt = "④ Gates & Filtros"
+string gateMode = input.string("Soft", "Modo dos Gates", options=["Off","Soft","Medium","Hard"], group=gpFilt)
+float  minGateFrac  = input.float(0.35, "Medium: fração mínima de gates OK", minval=0.0, maxval=1.0, step=0.05, group=gpFilt)
+
+bool useEMA200   = input.bool(false, "Gate EMA200 (tendência)", group=gpFilt)
+bool useVWAPBand = input.bool(false, "Gate VWAP (faixa)", group=gpFilt)
+bool useVWAPImp  = input.bool(false, "Gate VWAP Impulso", group=gpFilt)
+bool useERmin    = input.bool(false, "Gate ER mínimo", group=gpFilt)
+bool useRVOLmin  = input.bool(false, "Gate RVOL mínimo", group=gpFilt)
+bool useATRpct   = input.bool(false, "Gate ATR% regime", group=gpFilt)
+bool useIBS      = input.bool(false, "Gate IBS faixa", group=gpFilt)
+bool useWR7NR7   = input.bool(false, "Gate WR7/NR7", group=gpFilt)
+bool useSlope    = input.bool(false, "Gate Slope (EMA/VWAP)", group=gpFilt)
+bool useMarket   = input.bool(false, "Gate Mercado (IBOV EMA200)", group=gpFilt)
+bool useGapATR   = input.bool(false, "Gate Gap normalizado por ATR", group=gpFilt)
+bool useCHOP     = input.bool(false, "Gate Choppiness (tendência)", group=gpFilt)
+
+float vwapBandPct = input.float(0.005, "VWAP: tolerância (% do preço)", minval=0.0, step=0.0001, group=gpFilt)
+float vwapSlopeMinPct = input.float(0.04, "VWAP Impulso: inclinação mín (%/bar)", minval=0.0, step=0.005, group=gpFilt)
+float vwapMaxDistPct  = input.float(0.75, "VWAP Impulso: dist máx (% do preço)", minval=0.1, step=0.05, group=gpFilt)
+int   erLen   = input.int(14, "ER período", minval=2, group=gpFilt)
+float erMin   = input.float(0.2, "ER mínimo", minval=0.0, step=0.01, group=gpFilt)
+float rvolMin = input.float(1.2, "RVOL mínimo", minval=0.0, step=0.1, group=gpFilt)
+float atrPctMin= input.float(0.2, "ATR% mín", minval=0.0, step=0.1, group=gpFilt)
+float atrPctMax= input.float(8.0, "ATR% máx", minval=0.0, step=0.1, group=gpFilt)
+float ibsMin= input.float(0.1, "IBS mínimo", minval=0.0, maxval=1.0, step=0.01, group=gpFilt)
+float ibsMax= input.float(0.9, "IBS máximo", minval=0.0, maxval=1.0, step=0.01, group=gpFilt)
+float slopeMin = input.float(0.0, "Slope mínimo abs.", minval=0.0, step=0.0001, group=gpFilt)
+string slopeSrc = input.string("EMA200", "Slope: fonte", options=["EMA200","VWAP"], group=gpFilt)
+string marketSym = input.string("BMFBOVESPA:IBOV", "Símbolo índice mercado", group=gpFilt)
+float maxGapATR = input.float(1.5, "Gap ATR máx", minval=0.0, step=0.1, group=gpFilt)
+int   chopLen = input.int(14, "CHOP len", minval=2, group=gpFilt)
+float chopMax   = input.float(61.8, "CHOP máx (trend <)", minval=0.0, maxval=100.0, step=0.5, group=gpFilt)
+
+// Cálculos
+float vwapSlopePct = math.abs((vwap - vwap[1]) / math.max(vwap[1], syminfo.mintick*10)) * 100.0
+bool  vwapRightSideL = close >= vwap
+bool  vwapRightSideS = close <= vwap
+bool  vwapDistOK     = math.abs((close - vwap)/close) * 100.0 <= vwapMaxDistPct
+bool  vwapSlopeOK    = vwapSlopePct >= vwapSlopeMinPct
+bool  ema200OK_L = close >= ema200
+bool  ema200OK_S = close <= ema200
+bool  vwapOK = math.abs((close - vwap)/close) <= vwapBandPct
+float changeAbs = math.abs(close - close[erLen])
+float moveAbs   = ta.sma(math.abs(ta.change(close)), erLen) * erLen
+float er        = moveAbs == 0.0 ? 0.0 : changeAbs / moveAbs
+float atrPct   = (atr14/close)*100.0
+float ibs      = (high - low) == 0 ? 0.5 : (close - low)/(high - low)
+float rng      = high - low
+float maxR7    = ta.highest(rng, 7)
+float minR7    = ta.lowest(rng, 7)
+bool  isWR7     = rng >= maxR7
+bool  isNR7     = rng <= minR7
+float srcSlope = slopeSrc=="EMA200" ? (ema200 - ema200[5]) : (vwap - vwap[5])
+float idxClose = request.security(marketSym, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+float idxEMA200= request.security(marketSym, timeframe.period, ta.ema(close,200), barmerge.gaps_off, barmerge.lookahead_off)
+bool  marketOK_L= idxClose >= idxEMA200
+bool  marketOK_S= idxClose <= idxEMA200
+float prevCloseD = request.security(syminfo.tickerid, "D", close[1], barmerge.gaps_off, barmerge.lookahead_off)
+float gapATR = atr14 == 0 ? 0.0 : math.abs(open - prevCloseD)/atr14
+float tr = math.max(high - low, syminfo.mintick)
+// CHOP fix
+float trMA      = ta.sma(tr, chopLen)
+float trSum     = trMA * chopLen
+float hiN       = ta.highest(high, chopLen)
+float loN       = ta.lowest(low,  chopLen)
+float chopRange = math.max(hiN - loN, syminfo.mintick)
+float chop      = 100.0 * (math.log10(trSum / chopRange) / math.log10(chopLen))
+
+// Gates por lado
+bool gEMA_L = not useEMA200   or ema200OK_L
+bool gEMA_S = not useEMA200   or ema200OK_S
+bool gVWAP  = not useVWAPBand or vwapOK
+bool gVIMP_L= not useVWAPImp  or (vwapRightSideL and vwapSlopeOK and vwapDistOK)
+bool gVIMP_S= not useVWAPImp  or (vwapRightSideS and vwapSlopeOK and vwapDistOK)
+bool gER    = not useERmin    or (er >= erMin)
+bool gRVOL  = not useRVOLmin  or (rvol >= rvolMin)
+bool gATR   = not useATRpct   or (atrPct >= atrPctMin and atrPct <= atrPctMax)
+bool gIBS   = not useIBS      or (ibs >= ibsMin and ibs <= ibsMax)
+bool gWRNR  = not useWR7NR7   or (isWR7 or isNR7)
+bool gSlope_L = not useSlope  or (srcSlope >=  slopeMin)
+bool gSlope_S = not useSlope  or (srcSlope <= -slopeMin)
+bool gMKT_L   = not useMarket or marketOK_L
+bool gMKT_S   = not useMarket or marketOK_S
+bool gGAP     = not useGapATR or (gapATR <= maxGapATR)
+bool gCHOP    = not useCHOP   or (chop <= chopMax)
+
+// Pesos (para score/size bonus)
+float wgEMA      = input.float(0.6, "Peso: EMA200 OK", step=0.1, group=gpFilt)
+float wgVWAP     = input.float(0.4, "Peso: VWAP OK", step=0.1, group=gpFilt)
+float wgVIMP     = input.float(0.5, "Peso: VWAP Impulso OK", step=0.1, group=gpFilt)
+float wgER       = input.float(0.3, "Peso: ER OK", step=0.1, group=gpFilt)
+float wgRVOL     = input.float(0.4, "Peso: RVOL OK", step=0.1, group=gpFilt)
+float wgATR      = input.float(0.2, "Peso: ATR% OK", step=0.1, group=gpFilt)
+float wgIBS      = input.float(0.2, "Peso: IBS OK", step=0.1, group=gpFilt)
+float wgWRNR     = input.float(0.2, "Peso: WR/NR7 OK", step=0.1, group=gpFilt)
+float wgSlope    = input.float(0.3, "Peso: Slope OK", step=0.1, group=gpFilt)
+float wgMKT      = input.float(0.3, "Peso: Mercado OK", step=0.1, group=gpFilt)
+float wgGap      = input.float(0.2, "Peso: Gap OK", step=0.1, group=gpFilt)
+float wgCHOP     = input.float(0.3, "Peso: CHOP OK", step=0.1, group=gpFilt)
+
+float bonusL = 0.0
+float bonusS = 0.0
+float wAct   = 0.0
+
+// === Inputs / toggles de performance e alinhamento diário ===
+bool perf_skipCross = input.bool(false, "🛠️ Desligar consenso diário (ganha performance)", tooltip = "Quando ON, pula o cálculo de alinhamento diário (EMA200/ROC) para reduzir custo computacional.")
+bool useDailyAlign = input.bool(true, "Usar consenso diário (EMA200 + ROC)", tooltip = "Exige tendência diária a favor do sinal")
+
+// === Série diária (só usada se useDailyAlign e não perf_skipCross) ===
+float _d_close = request.security(syminfo.tickerid, "D", close)
+float _d_ema200 = request.security(syminfo.tickerid, "D", ta.ema(close, 200))
+float _d_roc20 = request.security(syminfo.tickerid, "D", ta.roc(close, 20))
+
+// Nota: mesmo com perf_skipCross, o Pine avalia as chamadas; o toggle serve para 'anular' o uso e baratear encadeamentos posteriores.
+// Se quiser micro-otimizar ainda mais, mova os request.security para uma seção compartilhada ou use resoluções maiores.
+
+float dClose = perf_skipCross ? na : _d_close
+float dEMA200 = perf_skipCross ? na : _d_ema200
+float dROC20 = perf_skipCross ? na : _d_roc20
+bool dayAlignL = useDailyAlign and not perf_skipCross and (dClose > dEMA200) and (dROC20 > 0)
+bool dayAlignS = useDailyAlign and not perf_skipCross and (dClose < dEMA200) and (dROC20 < 0)
+
+// === OR: alinhamento com GAP do dia (pré-abertura vs fechamento anterior) ===
+bool or_alignGap = input.bool(true, "Alinhar com GAP do dia", tooltip = "Se ON, só permite trades na direção do GAP (com tolerância).")
+float or_gapMinPct = input.float(0.20, "GAP mínimo %", step = 0.05, tooltip = "Mínimo absoluto do GAP para considerar alinhamento. Ex.: 0.20 = 0,20%")
+
+float _d_prevClose = request.security(syminfo.tickerid, "D", close[1])
+float _d_open = request.security(syminfo.tickerid, "D", open)
+float _gapPct = na(_d_prevClose) ? 0.0 : 100.0 * (_d_open - _d_prevClose) / _d_prevClose
+
+bool preGapAlignL = not or_alignGap or (_gapPct >= or_gapMinPct)
+bool preGapAlignS = not or_alignGap or (_gapPct <= -or_gapMinPct)
+
+// === PATCH A: YZ-Vol Regime (cole no grupo ⑤ Gates & Filtros, após seus inputs) ===
+string gpYZ = "④.b Gate Volatilidade (Yang–Zhang)"
+bool  useYZ        = input.bool(false, "Usar Gate YZ-Vol", group=gpYZ)
+string yzMode      = input.string("Off", "Modo YZ", options=["Off","Block","Weight"], group=gpYZ)
+float yzMinPct     = input.float(0.20, "YZ% mín (por barra)", step=0.01, group=gpYZ)
+float yzMaxPct     = input.float(8.00, "YZ% máx (por barra)", step=0.01, group=gpYZ)
+float yzWeightGain = input.float(20.0, "Weight: bônus qty em regime bom (%)", minval=0, step=1, group=gpYZ)
+
+// Cálculo YZ (aprox. intraday, robusto a gaps)
+float rr  = math.log(close/open)
+float co  = math.log(open/close[1])
+float u2  = math.pow(math.log(high/close), 2)
+float d2  = math.pow(math.log(low/close),  2)
+// sigma^2_YZ ≈ 0.34*co² + 0.66*(rr - co)² + 0.5*(u2+d2)
+float sigmaYZ2 = 0.34*co*co + 0.66*math.pow(rr - co, 2) + 0.5*(u2 + d2)
+float yzPctNow = math.sqrt(math.max(sigmaYZ2, 0.0)) * 100.0
+
+bool  gYZ = (yzPctNow >= yzMinPct and yzPctNow <= yzMaxPct)
+
+// --- Smart-Filter DON --- (após sigDonL/sigDonS)
+string gpDonSF = "③.b.1 Donchian Smart-Filter"
+bool  donSF_use      = input.bool(true, "Don: aplicar filtros", group=gpDonSF)
+float don_adxMin     = input.float(18,  "Min ADX", step=0.5, group=gpDonSF)
+int   don_consolLen  = input.int(10,    "Consolidação: len", minval=3, group=gpDonSF)
+float don_consolATRx = input.float(0.80,"σ(close) ≤ X×ATR14", step=0.05, group=gpDonSF)
+float don_rvolMin    = input.float(1.20,"RVOL mín no rompimento", step=0.05, group=gpDonSF)
+float don_minFrac    = input.float(0.60,"Fraç. mín de filtros ok", minval=0.1, maxval=1.0, step=0.05, group=gpDonSF)
+
+// pré-cálculos baratos
+float _sd_don = ta.stdev(close, don_consolLen)
+bool  don_consolOK = _sd_don <= don_consolATRx*atr14
+bool  don_adxOK    = adxV >= don_adxMin
+bool  don_rvolOK   = rvol >= don_rvolMin
+bool  don_slopeOKL = srcSlope >= slopeMin
+bool  don_slopeOKS = srcSlope <= -slopeMin
+bool  don_chopOK   = chop <= chopMax
+
+int nDon = 5, passDonL = 0, passDonS = 0
+passDonL += don_consolOK ? 1 : 0
+passDonS += don_consolOK ? 1 : 0
+passDonL += don_adxOK    ? 1 : 0
+passDonS += don_adxOK    ? 1 : 0
+passDonL += don_rvolOK   ? 1 : 0
+passDonS += don_rvolOK   ? 1 : 0
+passDonL += don_slopeOKL ? 1 : 0
+passDonS += don_slopeOKS ? 1 : 0
+passDonL += don_chopOK   ? 1 : 0
+passDonS += don_chopOK   ? 1 : 0
+
+bool don_passL = (passDonL >= math.ceil(don_minFrac*nDon))
+bool don_passS = (passDonS >= math.ceil(don_minFrac*nDon))
+
+sigDonL := sigDonL and (not donSF_use or don_passL)
+sigDonS := sigDonS and (not donSF_use or don_passS)
+
+// --- Smart-Filter OR ---
+string gpORSF = "③.b.2 OR Smart-Filter"
+bool  orSF_use    = input.bool(true, "OR: aplicar filtros", group=gpORSF)
+float or_rvolMin  = input.float(1.30,"RVOL mín", step=0.05, group=gpORSF)
+float or_vwapPPB  = input.float(0.04,"Slope VWAP mín (%/bar)", step=0.01, group=gpORSF)
+float or_minFrac  = input.float(0.60, "Fraç. mín ok", minval=0.1, maxval=1.0, step=0.05, group=gpORSF)
+
+bool  or_rvOK   = rvol >= or_rvolMin
+bool  or_slopeOK= vwapSlopePct >= or_vwapPPB
+bool  or_gapL   = preGapAlignL
+bool  or_gapS   = preGapAlignS
+bool  or_chopOK = chop <= chopMax
+
+int nOR = 4, passORL = 0, passORS = 0
+passORL += or_rvOK    ? 1 : 0
+passORS += or_rvOK    ? 1 : 0
+passORL += or_slopeOK ? 1 : 0
+passORS += or_slopeOK ? 1 : 0
+passORL += (not or_alignGap or or_gapL) ? 1 : 0
+passORS += (not or_alignGap or or_gapS) ? 1 : 0
+passORL += or_chopOK  ? 1 : 0
+passORS += or_chopOK  ? 1 : 0
+
+bool or_passL = passORL >= math.ceil(or_minFrac*nOR)
+bool or_passS = passORS >= math.ceil(or_minFrac*nOR)
+
+sigORL := sigORL and (not orSF_use or or_passL)
+sigORS := sigORS and (not orSF_use or or_passS)
+
+// --- Smart-Filter Inside ---
+string gpINSF = "③.b.3 Inside Smart-Filter"
+bool  inSF_use     = input.bool(true, "Inside: aplicar filtros", group=gpINSF)
+int   in_conLen    = input.int(8,   "Consolidação len", minval=3, group=gpINSF)
+float in_stdevATRx = input.float(0.75, "σ(close) ≤ X×ATR", step=0.05, group=gpINSF)
+float in_adxMin    = input.float(16, "Min ADX", step=0.5, group=gpINSF)
+float in_minFrac   = input.float(0.60, "Fraç. mín ok", minval=0.1, maxval=1.0, step=0.05, group=gpINSF)
+
+float _sd_in     = ta.stdev(close, in_conLen)
+bool  in_consol  = _sd_in <= in_stdevATRx*atr14
+bool  in_adxOK   = adxV >= in_adxMin
+bool  in_chopOK  = chop <= chopMax
+bool  in_slopeL  = srcSlope >= slopeMin
+bool  in_slopeS  = srcSlope <= -slopeMin
+
+int nIN=4, passINL=0, passINS=0
+passINL += in_consol ? 1 : 0
+passINS += in_consol ? 1 : 0
+passINL += in_adxOK  ? 1 : 0
+passINS += in_adxOK  ? 1 : 0
+passINL += in_slopeL ? 1 : 0
+passINS += in_slopeS ? 1 : 0
+passINL += in_chopOK ? 1 : 0
+passINS += in_chopOK ? 1 : 0
+
+bool in_passL = passINL >= math.ceil(in_minFrac*nIN)
+bool in_passS = passINS >= math.ceil(in_minFrac*nIN)
+
+sigInsideL := sigInsideL and (not inSF_use or in_passL)
+sigInsideS := sigInsideS and (not inSF_use or in_passS)
+
+// --- Smart-Filter TwoBar ---
+string gp2BSF = "③.b.4 TwoBar Smart-Filter"
+bool  t2SF_use   = input.bool(true, "TwoBar: aplicar filtros", group=gp2BSF)
+float t2_adxMin  = input.float(14, "Min ADX", step=0.5, group=gp2BSF)
+float t2_rsiLMax = input.float(45, "RSI L ≤", step=1, group=gp2BSF)
+float t2_rsiSMin = input.float(55, "RSI S ≥", step=1, group=gp2BSF)
+float t2_minFrac = input.float(0.60, "Fraç. mín ok", minval=0.1, maxval=1.0, step=0.05, group=gp2BSF)
+
+bool t2_adxOK  = adxV >= t2_adxMin
+bool t2_rsiOKL = rsi14 <= t2_rsiLMax
+bool t2_rsiOKS = rsi14 >= t2_rsiSMin
+bool t2_chopOK = chop <= chopMax
+
+int nT=3, passTL=0, passTS=0
+passTL += t2_adxOK  ? 1 : 0
+passTS += t2_adxOK  ? 1 : 0
+passTL += t2_rsiOKL ? 1 : 0
+passTS += t2_rsiOKS ? 1 : 0
+passTL += t2_chopOK ? 1 : 0
+passTS += t2_chopOK ? 1 : 0
+
+bool t2_passL = passTL >= math.ceil(t2_minFrac*nT)
+bool t2_passS = passTS >= math.ceil(t2_minFrac*nT)
+
+sig2BarL := sig2BarL and (not t2SF_use or t2_passL)
+sig2BarS := sig2BarS and (not t2SF_use or t2_passS)
+
+// --- Smart-Filter BOSCont ---
+string gpBOSSF = "③.b.5 BOSCont Smart-Filter"
+bool  bosSF_use   = input.bool(true, "BOSCont: filtros extras", group=gpBOSSF)
+float bos_adxMin  = input.float(18, "Min ADX", step=0.5, group=gpBOSSF)
+float bos_rvolMin = input.float(1.15,"RVOL mín", step=0.05, group=gpBOSSF)
+float bos_minFrac = input.float(0.60,"Fraç. mín ok", minval=0.1, maxval=1.0, step=0.05, group=gpBOSSF)
+
+bool bos_adxOK  = adxV >= bos_adxMin
+bool bos_rvOK   = rvol >= bos_rvolMin
+bool bos_chopOK = chop <= chopMax
+
+int nB=3, passBL=0, passBS=0
+passBL += bos_adxOK  ? 1 : 0
+passBS += bos_adxOK  ? 1 : 0
+passBL += bos_rvOK   ? 1 : 0
+passBS += bos_rvOK   ? 1 : 0
+passBL += bos_chopOK ? 1 : 0
+passBS += bos_chopOK ? 1 : 0
+
+bool bos_passL = passBL >= math.ceil(bos_minFrac*nB)
+bool bos_passS = passBS >= math.ceil(bos_minFrac*nB)
+
+sigBOSContL := sigBOSContL and (not bosSF_use or bos_passL)
+sigBOSContS := sigBOSContS and (not bosSF_use or bos_passS)
+
+// ============================================================================
+// ⑧ Consolidação dos gates – versão linearizada e robusta
+// ============================================================================
+// EMA200
+wAct   += useEMA200                  ? wgEMA   : 0.0
+bonusL += (useEMA200 and gEMA_L)     ? wgEMA   : 0.0
+bonusS += (useEMA200 and gEMA_S)     ? wgEMA   : 0.0
+// VWAP (faixa)
+wAct   += useVWAPBand                ? wgVWAP  : 0.0
+bonusL += (useVWAPBand and gVWAP)    ? wgVWAP  : 0.0
+bonusS += (useVWAPBand and gVWAP)    ? wgVWAP  : 0.0
+// VWAP Impulso
+wAct   += useVWAPImp                 ? wgVIMP  : 0.0
+bonusL += (useVWAPImp and gVIMP_L)   ? wgVIMP  : 0.0
+bonusS += (useVWAPImp and gVIMP_S)   ? wgVIMP  : 0.0
+// ER mínimo
+wAct   += useERmin                   ? wgER    : 0.0
+bonusL += (useERmin and gER)         ? wgER    : 0.0
+bonusS += (useERmin and gER)         ? wgER    : 0.0
+// RVOL mínimo
+wAct   += useRVOLmin                 ? wgRVOL  : 0.0
+bonusL += (useRVOLmin and gRVOL)     ? wgRVOL  : 0.0
+bonusS += (useRVOLmin and gRVOL)     ? wgRVOL  : 0.0
+// ATR% regime
+wAct   += useATRpct                  ? wgATR   : 0.0
+bonusL += (useATRpct and gATR)       ? wgATR   : 0.0
+bonusS += (useATRpct and gATR)       ? wgATR   : 0.0
+// IBS
+wAct   += useIBS                     ? wgIBS   : 0.0
+bonusL += (useIBS and gIBS)          ? wgIBS   : 0.0
+bonusS += (useIBS and gIBS)          ? wgIBS   : 0.0
+// WR7/NR7
+wAct   += useWR7NR7                  ? wgWRNR  : 0.0
+bonusL += (useWR7NR7 and gWRNR)      ? wgWRNR  : 0.0
+bonusS += (useWR7NR7 and gWRNR)      ? wgWRNR  : 0.0
+// Slope
+wAct   += useSlope                   ? wgSlope : 0.0
+bonusL += (useSlope and gSlope_L)    ? wgSlope : 0.0
+bonusS += (useSlope and gSlope_S)    ? wgSlope : 0.0
+// Mercado (índice)
+wAct   += useMarket                  ? wgMKT   : 0.0
+bonusL += (useMarket and gMKT_L)     ? wgMKT   : 0.0
+bonusS += (useMarket and gMKT_S)     ? wgMKT   : 0.0
+// Gap/ATR
+wAct   += useGapATR                  ? wgGap   : 0.0
+bonusL += (useGapATR and gGAP)       ? wgGap   : 0.0
+bonusS += (useGapATR and gGAP)       ? wgGap   : 0.0
+// CHOP
+wAct   += useCHOP                    ? wgCHOP  : 0.0
+bonusL += (useCHOP and gCHOP)        ? wgCHOP  : 0.0
+bonusS += (useCHOP and gCHOP)        ? wgCHOP  : 0.0
+
+// === PATCH B: CUSUM (mudança material) ===
+string gpCUSUM = "④.c Gate/Boost por Evento (CUSUM)"
+bool  useCUSUM   = input.bool(false, "Usar CUSUM", group=gpCUSUM)
+string cusumMode = input.string("Off", "Modo CUSUM", options=["Off","Block","Weight"], group=gpCUSUM)
+float cusumK_ATR = input.float(0.50, "Limiar (k × ATR14)", step=0.05, group=gpCUSUM)
+float cusumBoost = input.float(15.0, "Weight: bônus qty quando em evento (%)", minval=0, step=1, group=gpCUSUM)  // já está ok
+
+var float _cus = 0.0
+float kCus = cusumK_ATR * atr14
+_cus += (close - close[1])
+bool evtUp   = _cus >  kCus
+bool evtDown = _cus < -kCus
+if evtUp or evtDown
+    _cus := 0.0
+
+bool gCUSUM = evtUp or evtDown
+
+// integra como gate leve (score/contadores)
+wAct   += useCUSUM ? 0.2 : 0.0
+bonusL += (useCUSUM and gCUSUM) ? 0.2 : 0.0
+bonusS += (useCUSUM and gCUSUM) ? 0.2 : 0.0
+
+
+// HODv2 — reaproveita hod_use / hod_block_now / hod_mult_now
+wAct   += hod_use ? 0.2 : 0.0
+bonusL += (hod_use and not hod_block_now and hod_mult_now >= 1.0) ? 0.2 : 0.0
+bonusS += (hod_use and not hod_block_now and hod_mult_now >= 1.0) ? 0.2 : 0.0
+
+float bonusLnorm = wAct == 0.0 ? 1.0 : clampf(bonusL / wAct, 0.0, 1.0)
+float bonusSnorm = wAct == 0.0 ? 1.0 : clampf(bonusS / wAct, 0.0, 1.0)
+
+// -----------------------------------------------------------------------------
+// Bloco 589–600 reescrito: contadores por gate, sem tuplas
+// -----------------------------------------------------------------------------
+int nAct   = 0
+int nPassL = 0
+int nPassS = 0
+
+// HODv2 conta como gate leve (passa quando não está bloqueado)
+if hod_use
+    nAct += 1
+    if not hod_block_now
+        nPassL += 1
+        nPassS += 1
+
+// EMA200
+if useEMA200
+    nAct   += 1
+    if gEMA_L
+        nPassL += 1
+    if gEMA_S
+        nPassS += 1
+
+// VWAP Band
+if useVWAPBand
+    nAct   += 1
+    if gVWAP
+        nPassL += 1
+        nPassS += 1
+
+// VWAP Impulso
+if useVWAPImp
+    nAct   += 1
+    if gVIMP_L
+        nPassL += 1
+    if gVIMP_S
+        nPassS += 1
+
+// ER mínimo
+if useERmin
+    nAct   += 1
+    if gER
+        nPassL += 1
+        nPassS += 1
+
+// RVOL mínimo
+if useRVOLmin
+    nAct   += 1
+    if gRVOL
+        nPassL += 1
+        nPassS += 1
+
+// ATR%
+if useATRpct
+    nAct   += 1
+    if gATR
+        nPassL += 1
+        nPassS += 1
+
+// IBS
+if useIBS
+    nAct   += 1
+    if gIBS
+        nPassL += 1
+        nPassS += 1
+
+// WR7/NR7
+if useWR7NR7
+    nAct   += 1
+    if gWRNR
+        nPassL += 1
+        nPassS += 1
+
+// Slope
+if useSlope
+    nAct   += 1
+    if gSlope_L
+        nPassL += 1
+    if gSlope_S
+        nPassS += 1
+
+// Mercado (índice)
+if useMarket
+    nAct   += 1
+    if gMKT_L
+        nPassL += 1
+    if gMKT_S
+        nPassS += 1
+
+// Gap/ATR
+if useGapATR
+    nAct   += 1
+    if gGAP
+        nPassL += 1
+        nPassS += 1
+
+// CHOP
+if useCHOP
+    nAct   += 1
+    if gCHOP
+        nPassL += 1
+        nPassS += 1
+
+// --- Contadores extras vindos dos novos gates (YZ/CUSUM/HOD) ---
+if useYZ
+    nAct += 1
+    if gYZ
+        nPassL += 1
+        nPassS += 1
+
+if useCUSUM
+    nAct += 1
+    if gCUSUM
+        nPassL += 1
+        nPassS += 1
+
+
+bool passL_soft  = true
+bool passS_soft  = true
+bool passL_med   = (nAct == 0) or (nPassL >= int(math.ceil(minGateFrac * nAct)))
+bool passS_med   = (nAct == 0) or (nPassS >= int(math.ceil(minGateFrac * nAct)))
+bool passL_hard  = (nAct == 0) or (nPassL == nAct)
+bool passS_hard  = (nAct == 0) or (nPassS == nAct)
+
+bool passL_gates = pass_by_mode(gateMode, passL_soft, passL_med, passL_hard)
+bool passS_gates = pass_by_mode(gateMode, passS_soft, passS_med, passS_hard)
+
+// === PATCH 4.2 — Continuation Smart Filter (método CONT) ===
+string gpContSF = "③.b CONT: Smart Filter (método)"
+bool  cont_sf_on      = input.bool(true,  "Ativar filtro específico p/ CONT", group=gpContSF)
+float cont_adxMin     = input.float(20.0, "ADX mínimo (força)", step=0.5, group=gpContSF)
+float cont_vwSlopeMin = input.float(0.05, "VWAP slope mín (%/bar)", step=0.01, group=gpContSF)
+float cont_chopMax    = input.float(58.0, "CHOP máx (trend <)", minval=0, maxval=100, step=0.5, group=gpContSF)
+float cont_ibMin      = input.float(0.20, "IBS mínimo", minval=0, maxval=1, step=0.01, group=gpContSF)
+float cont_ibMax      = input.float(0.80, "IBS máximo", minval=0, maxval=1, step=0.01, group=gpContSF)
+bool  cont_usePerf    = input.bool(true,  "Punir CONT após N stops no dia (≥2)", group=gpContSF)
+float cont_volBoost   = input.float(1.50, "Ignorar punição se RVOL ≥", step=0.1, group=gpContSF)
+float cont_minFrac    = input.float(0.60, "Frac. mín. de gates p/ CONT (0..1)", minval=0.0, maxval=1.0, step=0.05, group=gpContSF)
+
+// Métricas locais (reusam cálculos globais já existentes)
+float adxC     = f_adx(14)
+bool  c_adxOK  = (adxC >= cont_adxMin) and (adxC > adxC[5])             // força e subida
+bool  c_vwSl   = (vwapSlopePct >= cont_vwSlopeMin)                      // impulso
+bool  c_trendL = (ema20 > ema20[5]) and (close >= ema20) and (close >= vwap)
+bool  c_trendS = (ema20 < ema20[5]) and (close <= ema20) and (close <= vwap)
+bool  c_chopOK = (chop <= cont_chopMax)
+bool  c_ibOK   = (ibs >= cont_ibMin and ibs <= cont_ibMax)
+
+// Contagem por lado
+int c_nAct   = cont_sf_on ? 5 : 0
+int c_nPassL = cont_sf_on ? ((c_adxOK?1:0) + (c_vwSl?1:0) + (c_trendL?1:0) + (c_chopOK?1:0) + (c_ibOK?1:0)) : 0
+int c_nPassS = cont_sf_on ? ((c_adxOK?1:0) + (c_vwSl?1:0) + (c_trendS?1:0) + (c_chopOK?1:0) + (c_ibOK?1:0)) : 0
+
+// Punição leve por performance do próprio método no dia (como BOSCont)
+var int cont_failDay = 0
+if ta.change(time("D")) != 0
+    cont_failDay := 0
+bool cont_punish = cont_usePerf and (cont_failDay >= 2) and (rvol < cont_volBoost)
+
+// Passa se atingir fração mínima
+bool contPassL = (not cont_sf_on) or (c_nPassL >= int(math.ceil(cont_minFrac * c_nAct)))
+bool contPassS = (not cont_sf_on) or (c_nPassS >= int(math.ceil(cont_minFrac * c_nAct)))
+
+// Aplicar sobre os sinais CONT já definidos
+sigContL := sigContL and contPassL and not cont_punish
+sigContS := sigContS and contPassS and not cont_punish
+
+// -----------------------------------------------------------------------------
+// ⑥ Score (desempate) + bônus de gates
+// -----------------------------------------------------------------------------
+string gpScore = "⑤ Score (desempate)"
+float wBase = input.float(1.0, "Peso base", step=0.25, group=gpScore)
+float wInside = input.float(1.2, "Peso Inside", step=0.25, group=gpScore)
+float wEngulf = input.float(0.9, "Peso Engulfing", step=0.25, group=gpScore)
+float wDon    = input.float(1.1, "Peso Donchian", step=0.25, group=gpScore)
+float wCont   = input.float(1.0, "Peso EMA Continuation", step=0.25, group=gpScore)
+float wVWAPm  = input.float(1.0, "Peso VWAP Reversal", step=0.25, group=gpScore)
+float wOR     = input.float(0.9, "Peso Opening Range", step=0.25, group=gpScore)
+float wRSIDiv = input.float(0.8, "Peso RSI Divergência", step=0.25, group=gpScore)
+float wRangeRet = input.float(0.9, "Peso Range+Reteste", step=0.25, group=gpScore)
+float wBOPB   = input.float(0.9, "Peso BOPB", step=0.25, group=gpScore)
+float wLW96   = input.float(0.8, "Peso LW 9.6", step=0.25, group=gpScore)
+float wORFade = input.float(0.9, "Peso OR Fade", step=0.25, group=gpScore)
+float w2Bar   = input.float(0.9, "Peso 2-Bar", step=0.25, group=gpScore)
+float wBOSCont= input.float(0.7, "Peso BOS Continuação", step=0.25, group=gpScore)
+float wADX     = input.float(0.9, "Peso ADX Compression", step=0.25, group=gpScore)
+float wRSIFS   = input.float(0.9, "Peso RSI Failure Swing", step=0.25, group=gpScore)
+float wConflu  = input.float(1.1, "Peso EMA–VWAP Confluence", step=0.25, group=gpScore)
+float wATRexp  = input.float(0.8, "Peso ATR Expansion", step=0.25, group=gpScore)
+bool  useScoreCut = input.bool(true, "Aplicar mínimo de score?", group=gpScore)
+float scoreMinCut = input.float(0.4, "Score mínimo p/ aceitar", step=0.1, group=gpScore)
+float gateBonusScale = input.float(1.0, "Escala do bônus de gates no score", step=0.1, group=gpScore)
+
+methodScore(string name) =>
+    float s = wBase
+    if      name == "Inside"
+        s += wInside
+    else if name == "Engulf"
+        s += wEngulf
+    else if name == "Don"
+        s += wDon
+    else if name == "Cont"
+        s += wCont
+    else if name == "VWAP"
+        s += wVWAPm
+    else if name == "OR"
+        s += wOR
+    else if name == "RSIDiv"
+        s += wRSIDiv
+    else if name == "RangeRet"
+        s += wRangeRet
+    else if name == "BOPB"
+        s += wBOPB
+    else if name == "LW96"
+        s += wLW96
+    else if name == "ORFade"
+        s += wORFade
+    else if name == "TwoBar"
+        s += w2Bar
+    else if name == "BOSCont"
+        s += wBOSCont
+    else if name == "ADX"
+        s += wADX
+    else if name == "RSIFS"
+        s += wRSIFS
+    else if name == "Conflu"
+        s += wConflu
+    else if name == "ATRexp"
+        s += wATRexp
+
+    s
+
+float gateMultL = 1.0 + gateBonusScale*(bonusLnorm - 0.5)*0.2
+float gateMultS = 1.0 + gateBonusScale*(bonusSnorm - 0.5)*0.2
+
+// -----------------------------------------------------------------------------
+// ⑦ Footprint/Profile/VWAP2 (multiplicadores e blocks)
+// -----------------------------------------------------------------------------
+string gpFP = "⑤.b Footprint/Profile & VWAP2"
+bool fp_use    = input.bool(false, "Footprint-lite: usar", group=gpFP)
+string fp_mode = input.string("Weight", "Footprint: modo", options=["Weight","Block"], group=gpFP)
+float fp_wDelta   = input.float(0.4, "FP peso: z-Delta", step=0.1, group=gpFP)
+float fp_wImb     = input.float(0.2, "FP peso: Imbalance", step=0.1, group=gpFP)
+float fp_wEffRes  = input.float(0.1, "FP peso: Effort/Result", step=0.1, group=gpFP)
+float fp_wClosePos= input.float(0.2, "FP peso: ClosePos", step=0.1, group=gpFP)
+float fp_wZVol    = input.float(0.1, "FP peso: z-Vol", step=0.1, group=gpFP)
+float fp_deltaStrong = input.float(1.0, "FP limiar: z-Delta forte", step=0.1, group=gpFP)
+float fp_imbStrong   = input.float(0.2, "FP limiar: Imbalance forte", step=0.05, group=gpFP)
+float fp_effResMin   = input.float(0.00005, "FP limiar: Eff/Result min", step=0.00001, group=gpFP)
+float fp_zVolStrong  = input.float(1.0, "FP limiar: z-Vol forte", step=0.1, group=gpFP)
+
+bool vp_use    = input.bool(false, "Profile-lite (AVWAP/VA): usar", group=gpFP)
+string vp_mode = input.string("Weight", "Profile: modo", options=["Weight","Block"], group=gpFP)
+string vp_anchor = input.string("SessionOpen", "AVWAP Âncora", options=["SessionOpen","ORBreak","CustomTime"], group=gpFP)
+string vp_timeHHMM = input.string("1000", "Se CustomTime: HHMM", group=gpFP)
+float  vp_sdMult = input.float(1.0, "VA-lite: desvio p/ banda", step=0.1, group=gpFP)
+float  vp_wVWAPFavor = input.float(0.5, "VP peso: favor VWAP", step=0.1, group=gpFP)
+float  vp_wRVOL      = input.float(0.3, "VP peso: regime RVOL", step=0.1, group=gpFP)
+float  vp_wATRpct    = input.float(0.2, "VP peso: regime ATR%", step=0.1, group=gpFP)
+
+// VWAP 2.0
+bool  v2_use   = input.bool(true, "VWAP 2.0: usar (trend/dist)", group=gpFP)
+string v2_mode = input.string("Weight", "VWAP 2.0: modo", options=["Weight","Block"], group=gpFP)
+float  v2_slopeMin = input.float(0.03, "VWAP2: slope mín %/bar", step=0.01, group=gpFP)
+float  v2_maxDist  = input.float(1.0,  "VWAP2: dist máx % preço", step=0.1, group=gpFP)
+
+// AVWAP/VA-lite
+// AVWAP/VA-lite (corrigido: avwap = Σ(P×V)/Σ(V) a partir do anchor)
+var float avwap = na
+var float avwapPV = na      // soma ponderada preço×volume
+var float avwapVol = na     // soma de volume
+bool anchorNow = false
+
+if vp_use
+    if vp_anchor == "SessionOpen"
+        anchorNow := ta.change(time("D")) != 0
+    else if vp_anchor == "ORBreak"
+        anchorNow := ta.crossover(close, orHigh) or ta.crossunder(close, orLow)
+    else
+        string _vpHH = str.substring(vp_timeHHMM, 0, 2)
+        string _vpMM = str.substring(vp_timeHHMM, 2, 4)
+        float  _vpHF = nz(str.tonumber(_vpHH), 10.0)
+        float  _vpMF = nz(str.tonumber(_vpMM),  0.0)
+        int    ah    = int(math.floor(clampf(_vpHF, 0.0, 23.0)))
+        int    am    = int(math.floor(clampf(_vpMF, 0.0, 59.0)))
+        int _h = hour(time)
+        int _m = minute(time)
+        anchorNow := (_h == ah and _m == am)
+
+    if anchorNow or na(avwap)
+        avwapPV  := close * volume
+        avwapVol := volume
+        avwap    := avwapVol > 0 ? (avwapPV / avwapVol) : close
+    else
+        avwapPV  += close * volume
+        avwapVol += volume
+        avwap    := avwapVol > 0 ? (avwapPV / avwapVol) : avwap
+
+float stdevL = ta.stdev(close, 50)
+float vaTop  = vp_use ? avwap + vp_sdMult * stdevL : na
+float vaBot  = vp_use ? avwap - vp_sdMult * stdevL : na
+bool  vpFavorL = vp_use ? (close >= avwap and (na(vaTop) or close <= vaTop)) : true
+bool  vpFavorS = vp_use ? (close <= avwap and (na(vaBot) or close >= vaBot)) : true
+float vp_ctxL  = (vpFavorL ? vp_wVWAPFavor : 0.0) + math.max(rvol-1.0,0.0)*vp_wRVOL + (atrPct/100.0)*vp_wATRpct
+float vp_ctxS  = (vpFavorS ? vp_wVWAPFavor : 0.0) + math.max(rvol-1.0,0.0)*vp_wRVOL + (atrPct/100.0)*vp_wATRpct
+
+// Quiet Regime: baixa volatilidade → filtrar setups de breakout “frágeis”
+bool quietRegime = (rvol < 0.8) and (atrPct < 0.4)
+// Desabilita temporariamente Inside/Don/OR quando “quiet”
+bool mInside_eff = mInside_on and not quietRegime
+bool mDon_eff    = mDon_on    and not quietRegime
+bool mOR_eff     = mOR_on     and not quietRegime
+
+// === PATCH 4.1 — aplicar quietRegime de fato nos sinais usados no picker ===
+sigInsideL := sigInsideL and (not quietRegime)
+sigInsideS := sigInsideS and (not quietRegime)
+sigDonL    := sigDonL    and (not quietRegime)
+sigDonS    := sigDonS    and (not quietRegime)
+sigORL     := sigORL     and (not quietRegime)
+sigORS     := sigORS     and (not quietRegime)
+
+// 4.1 — Anti‑lateralização: reaplica sinais exigindo CHOP abaixo do limite
+// Inside
+sigInsideL := mInside_on and (not avoidChop or chop < chopTight) and insidePrev and ta.crossover(close, high[1]) and (not inSF_use or in_passL)
+sigInsideS := mInside_on and (not avoidChop or chop < chopTight) and insidePrev and ta.crossunder(close, low[1])  and (not inSF_use or in_passS)
+
+// Donchian
+sigDonL    := mDon_on    and (not avoidChop or chop < chopTight) and ta.crossover(close, ta.highest(high, donLen)[1]) and (not donSF_use or don_passL)
+sigDonS    := mDon_on    and (not avoidChop or chop < chopTight) and ta.crossunder(close, ta.lowest(low,  donLen)[1])  and (not donSF_use or don_passS)
+
+// OR
+sigORL     := mOR_on     and (not avoidChop or chop < chopTight) and bar_index > orBars and ta.crossover(close, orHigh) and (not orSF_use or or_passL)
+sigORS     := mOR_on     and (not avoidChop or chop < chopTight) and bar_index > orBars and ta.crossunder(close, orLow)  and (not orSF_use or or_passS)
+
+
+float minCandleATR = input.float(0.60, "Reversais: range mínimo (×ATR14)", minval=0.0, step=0.05, group=gpMeth)
+float _rng_rev = high - low
+bool  bigEnough = _rng_rev >= minCandleATR * atr14
+
+sigEngulfL := mEngulf_on and bigEnough and bullEng
+sigEngulfS := mEngulf_on and bigEnough and bearEng
+sig2BarL   := m2Bar_on   and bigEnough and bull2Bar
+sig2BarS   := m2Bar_on   and bigEnough and bear2Bar
+// 4.3 — VWAP Reversal com slope/side coerentes (VWAP2 fix)
+sigVWAPL := mVWAP_on and v2_okL_fix and (close - vwap) < 0 and ta.crossover(close, vwap)
+sigVWAPS := mVWAP_on and v2_okS_fix and (close - vwap) > 0 and ta.crossunder(close, vwap)
+
+
+// === PATCH D: AVWAP multiâncora ===
+bool   avma_use    = input.bool(false, "Filtro: AVWAP Multiâncora")
+string avma_mode   = input.string("OFF", "AVWAP Modo", options=["OFF","Block","Weight"])
+float  avma_band   = input.float(1.00, "AVWAP Banda (×Desvio)")
+int    avma_stdlen = input.int(50, "AVWAP Período do Desvio", minval=10)
+float  avma_gain   = input.float(1.10, "AVWAP Peso (modo Weight)", minval=1.00)
+
+float dClosePrev = request.security(syminfo.tickerid, "D", close[1], barmerge.gaps_off, barmerge.lookahead_off)
+float avwaps  = ta.vwap(hlc3)
+float avwapD1 = request.security(syminfo.tickerid, "D", ta.vwap(hlc3))[1]
+
+// --- AVWAP Multiâncora (modo Block/Weight) — usar flags locais ---
+bool avmaBlock = false
+float avma_mult = 1.00
+// Parâmetros internos usados no AVWAP-Multi
+int   stLen       = avma_stdlen
+float band1_mult  = avma_band
+float band2_mult  = avma_band
+// Pré-cálculo (executa em toda barra)
+float _avma_stdev_raw = ta.stdev(close, avma_stdlen)
+float _stdev50_global  = ta.stdev(close, 50)  // reaproveite onde precisar
+float stL_raw = ta.stdev(close, stLen)
+float stL     = math.max(stL_raw, syminfo.mintick * 2.0)
+// Parâmetros internos usados no AVWAP-Multi
+
+if avma_use and avma_mode != "OFF"
+    bool ok_av = not na(avwap) and not na(avwapD1)
+    if ok_av
+        // depois
+        bool inBand1  = ok_av and (math.abs(close - avwap) < stL * band1_mult)
+        bool inBand2  = ok_av and (math.abs(close - avwap) < stL * band2_mult)
+        bool avmaOK = inBand1 and inBand2
+        if avma_mode == "Block"
+            avmaBlock := not avmaOK
+        if avma_mode == "Weight" and avmaOK
+            avma_mult := avma_gain
+
+// OR já existe (orHigh/orLow). Consideramos a âncora OR como a do seu avwap "vp_anchor==ORBreak"
+// Confluência: preço entre bandas de (avwap ± avma_band*stdevL) E (avwapD1 ± ...) simultaneamente
+float stL2 = ta.stdev(close, 50)
+bool inBand1 = avma_use ? (math.abs(close - avwap)   <= avma_band*stL2) : true
+bool inBand2 = avma_use ? (math.abs(close - avwapD1) <= avma_band*stL2) : true
+bool avmaOK  = inBand1 and inBand2
+
+// Block/Weight efetivo
+bool avmaBlockNow = avma_use and avma_mode=="Block" and not avmaOK
+if avma_use and avma_mode=="Weight" and avmaOK
+    avma_mult := 1.10
+
+// Métricas Footprint-lite
+float _tr  = math.max(high - low, syminfo.mintick)
+float _dpx = _tr > 0 ? (close - open) / _tr : 0.0
+float fp_delta = volume * _dpx
+float sma50d = ta.sma(fp_delta, 50)
+float std50d = ta.stdev(fp_delta, 50)
+float fp_zDelta = std50d > 0 ? (fp_delta - sma50d) / std50d : 0.0
+float wickTop = high - math.max(open, close)
+float wickBot = math.min(open, close) - low
+float fp_imb  = _tr > 0 ? (wickBot - wickTop) / _tr : 0.0
+float fp_evr  = volume > 0 ? _tr / volume : 0.0
+float fp_closePos = _tr > 0 ? (close - low) / _tr : 0.5
+float _mV = ta.sma(volume, 50)
+float _sV = math.sqrt(math.max(ta.variance(volume, 50), 0.0))
+float fp_zVol = _sV > 0 ? (volume - _mV) / _sV : 0.0
+
+// VWAP 2.0 favorabilidade
+float v2_fit_now  = math.abs((close     - vwap    ) / math.max(close,     syminfo.mintick*10)) * 100.0
+float v2_fit_prev = math.abs((close[1]  - vwap[1] ) / math.max(close[1],  syminfo.mintick*10)) * 100.0
+
+// REMOVER esta linha se ainda existir solta:
+float v2_dist = math.abs((close - vwap)/close) * 100.0
+bool v2_okL = true
+bool v2_okS = true
+if v2_use
+    v2_okL := (close >= vwap) and (not na(v2_slopePPB)) and (v2_slopePPB >=  v2fix_minPPB) and (v2_dist <= v2_maxDist)
+    v2_okS := (close <= vwap) and (not na(v2_slopePPB)) and (v2_slopePPB <= -v2fix_minPPB) and (v2_dist <= v2_maxDist)
+if v2fix_use
+    v2_okL := v2_okL and v2_okL_fix
+    v2_okS := v2_okS and v2_okS_fix
+// Multiplicadores (modo Weight)-
+float fp_multL = fp_use and fp_mode=="Weight" ? (1.0 + (fp_wDelta*math.max(fp_zDelta,0) + fp_wImb*math.max(fp_imb,0) + fp_wEffRes*clampf((fp_evr - fp_effResMin)/math.max(fp_effResMin,1e-9),0,1) + fp_wClosePos*fp_closePos + fp_wZVol*math.max(fp_zVol,0))*0.10) : 1.0
+float fp_multS = fp_use and fp_mode=="Weight" ? (1.0 + (fp_wDelta*math.max(-fp_zDelta,0) + fp_wImb*math.max(-fp_imb,0) + fp_wEffRes*clampf((fp_evr - fp_effResMin)/math.max(fp_effResMin,1e-9),0,1) + fp_wClosePos*(1.0 - fp_closePos) + fp_wZVol*math.max(fp_zVol,0))*0.10) : 1.0
+float vp_multL = vp_use and vp_mode=="Weight" ? (1.0 + vp_ctxL*0.10) : 1.0
+float vp_multS = vp_use and vp_mode=="Weight" ? (1.0 + vp_ctxS*0.10) : 1.0
+float v2_multL = v2_use and v2_mode=="Weight" ? (v2_okL ? 1.10 : 1.00) : 1.0
+float v2_multS = v2_use and v2_mode=="Weight" ? (v2_okS ? 1.10 : 1.00) : 1.0
+
+// StrongSignal (para Addon) & Blocks
+bool strongL = (fp_zDelta > fp_deltaStrong) and (fp_closePos > 0.66) and (fp_zVol > fp_zVolStrong) and v2_okL
+bool strongS = (fp_zDelta < -fp_deltaStrong) and (fp_closePos < 0.34) and (fp_zVol > fp_zVolStrong) and v2_okS
+bool fpBlockL = fp_use and fp_mode=="Block" and (fp_zDelta < -fp_deltaStrong or fp_closePos < 0.34)
+bool fpBlockS = fp_use and fp_mode=="Block" and (fp_zDelta >  fp_deltaStrong or fp_closePos > 0.66)
+bool vpBlockL = vp_use and vp_mode=="Block" and not vpFavorL
+bool vpBlockS = vp_use and vp_mode=="Block" and not vpFavorS
+bool v2BlockL = v2_use and v2_mode=="Block" and not v2_okL
+bool v2BlockS = v2_use and v2_mode=="Block" and not v2_okS
+// Histerese nos blocks de Footprint (evita flip-flop)
+float fp_releaseZDelta = fp_deltaStrong * 0.7
+float fp_releaseCloseP = 0.50
+
+var bool fpBlockedL_hold = false
+var bool fpBlockedS_hold = false
+
+// Entradas de bloqueio (mesma condição forte que você já usa)
+if fp_use and fp_mode=="Block"
+    if (fp_zDelta < -fp_deltaStrong or fp_closePos < 0.34)
+        fpBlockedL_hold := true
+    if (fp_zDelta >  fp_deltaStrong or fp_closePos > 0.66)
+        fpBlockedS_hold := true
+
+// Saídas do bloqueio (com folga / release)
+if fpBlockedL_hold and (fp_zDelta > -fp_releaseZDelta and fp_closePos >= fp_releaseCloseP)
+    fpBlockedL_hold := false
+if fpBlockedS_hold and (fp_zDelta <  fp_releaseZDelta and fp_closePos <= (1.0 - fp_releaseCloseP))
+    fpBlockedS_hold := false
+
+// Combine com blocks instantâneos
+bool fpBlockL_final = (fp_use and fp_mode=="Block" and (fp_zDelta < -fp_deltaStrong or fp_closePos < 0.34)) or fpBlockedL_hold
+bool fpBlockS_final = (fp_use and fp_mode=="Block" and (fp_zDelta >  fp_deltaStrong or fp_closePos > 0.66)) or fpBlockedS_hold
+// ============================================================================
+// ⑦.c Contexto v60+: Gap pré-mercado, Setor, Mercado, Factor-Momentum
+// ============================================================================
+string gpCtx = "⑤.c Contexto (Pré, Setor, Mercado, Factor-Momentum)"
+
+// --- Gap pré-mercado / overnight (normalizado por ATR) ---
+bool   usePreGap   = input.bool(true,  "Usar Gap pré-mercado (overnight)", group=gpCtx)
+float  preGapMinATRx = input.float(0.6, "Limiar: |Gap| ≥ X×ATR14", step=0.1, group=gpCtx)
+float  dOpen   = request.security(syminfo.tickerid, "D", open,  barmerge.gaps_off, barmerge.lookahead_off)
+float  dClose1 = request.security(syminfo.tickerid, "D", close[1], barmerge.gaps_off, barmerge.lookahead_off)
+float  preGap  = dClose1 == 0 ? 0.0 : (dOpen - dClose1)
+float  preGapATRx = atr14 > 0 ? math.abs(preGap) / atr14 : 0.0
+bool   preGapStrong = usePreGap and (preGapATRx >= preGapMinATRx)
+
+// --- Momentum do setor (símbolo índice setorial configurável) ---
+string gpSector2 = "⑦.b Setor & Mercado"
+string sectorSym  = input.string("BMFBOVESPA:ICON", "Símbolo do Setor (índice setorial)", group=gpSector2,
+     tooltip="Ex.: ICON (Consumo), IMAT (Materiais), IFNC (Financeiro), INDX (Industrial) etc.")
+int    momLenSec  = input.int(20, "Momentum do Setor: janela (barras)", minval=3, group=gpSector2)
+float secClose    = request.security(sectorSym, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+float secCloseLag = nz(secClose[momLenSec], secClose)
+float secROC      = nz(secClose / secCloseLag - 1.0, 0.0)
+bool   secAlignL  = secROC > 0
+bool   secAlignS  = secROC < 0
+
+// --- Momentum do mercado (reusa marketSym já existente) ---
+int    momLenMkt  = input.int(20, "Momentum do Mercado: janela (barras)", minval=3, group=gpSector2)
+float mktCloseP    = request.security(marketSym, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+float mktCloseLag  = nz(mktCloseP[momLenMkt], mktCloseP)
+float mktROC       = nz(mktCloseP / mktCloseLag - 1.0, 0.0)
+bool   mktAlignL  = mktROC > 0
+bool   mktAlignS  = mktROC < 0
+// amortecer sinais setoriais/mercado quando correlação 20b fraca
+float corrSec = ta.correlation(close, secClose, 20)
+float corrMkt = ta.correlation(close, mktCloseP, 20)
+secAlignL  := secAlignL and (corrSec > 0.1)
+secAlignS  := secAlignS and (corrSec > 0.1)
+mktAlignL  := mktAlignL and (corrMkt > 0.1)
+mktAlignS  := mktAlignS and (corrMkt > 0.1)
+// --- Factor-Momentum (EMA das confirmações recentes) ---
+int    fmLen      = input.int(30, "Factor-Momentum: EMA de confirmações", minval=5, group=gpCtx)
+float  confNowL   = 0.0
+float  confNowS   = 0.0
+// sinais "saudáveis": gates, VWAP2, FP pró, setor pró, mercado pró, gap pró
+confNowL += passL_gates ? 1.0 : 0.0
+confNowS += passS_gates ? 1.0 : 0.0
+confNowL += v2_okL ? 1.0 : 0.0
+confNowS += v2_okS ? 1.0 : 0.0
+confNowL += (fp_zDelta > 0 and fp_closePos > 0.5) ? 1.0 : 0.0
+confNowS += (fp_zDelta < 0 and fp_closePos < 0.5) ? 1.0 : 0.0
+confNowL += secAlignL ? 1.0 : 0.0
+confNowS += secAlignS ? 1.0 : 0.0
+confNowL += mktAlignL ? 1.0 : 0.0
+confNowS += mktAlignS ? 1.0 : 0.0
+confNowL += preGapAlignL ? 1.0 : 0.0
+confNowS += preGapAlignS ? 1.0 : 0.0
+
+// normaliza para 0..1 (máx 6 itens)
+float confNowL_norm = clampf(confNowL/6.0, 0.0, 1.0)
+float confNowS_norm = clampf(confNowS/6.0, 0.0, 1.0)
+
+var float confEMA_L = na
+var float confEMA_S = na
+float alpha = 2.0/(fmLen + 1.0)
+confEMA_L := na(confEMA_L) ? confNowL_norm : confEMA_L + (confNowL_norm - confEMA_L) * alpha
+confEMA_S := na(confEMA_S) ? confNowS_norm : confEMA_S + (confNowS_norm - confEMA_S) * alpha
+
+// >>> cole logo após calcular confEMA_L/confEMA_S (onde já existem rvol e confEMA_L)
+midAdj := inMidday
+     ? (1.0 - clampf(0.4*(1.0 - confEMA_L), 0.0, 0.4))
+       * (1.0 - clampf(0.3*math.max(1.0 - rvol, 0.0), 0.0, 0.3))
+     : 1.0
+
+string gpSet = "⑦.c Confirmação Setorial"
+bool  set_confirm = input.bool(false, "Confirmar Setor", group=gpSet)
+string set_criter = input.string("Direção", "Critério", options=["VWAP","Direção","Minima"], group=gpSet)
+
+
+// >>> PRÉ-CÁLCULOS (fora de qualquer if/loop)
+float secVWAP   = request.security(sectorSym, timeframe.period, ta.vwap(hlc3), barmerge.gaps_off, barmerge.lookahead_off)
+float secMin20  = request.security(sectorSym, timeframe.period, ta.lowest(low,  20), barmerge.gaps_off, barmerge.lookahead_off)
+float secMax20  = request.security(sectorSym, timeframe.period, ta.highest(high, 20), barmerge.gaps_off, barmerge.lookahead_off)
+
+bool  setOK_L = true
+bool  setOK_S = true
+
+if set_confirm
+    if set_criter == "VWAP"
+        setOK_L := secClose > secVWAP
+        setOK_S := secClose < secVWAP
+    if set_criter == "Direção"
+        setOK_L := secAlignL
+        setOK_S := secAlignS
+    if set_criter == "Minima"
+        setOK_L := secClose > secMin20
+        setOK_S := secClose < secMin20 // <— usa o setor, não o símbolo atual
+
+
+// -----------------------------------------------------------------------------
+// ⑧ Picker de método com bônus + multiplicadores de contexto
+// -----------------------------------------------------------------------------
+float ctxMultL  = gateMultL
+float ctxMultS  = gateMultS
+float tilt_mult_now = tiltTripNow and tilt_modo=="Reduzir size" ? tilt_sizeMult : 1.0
+float ctxMultL2 = ctxMultL * hod_mult_now * tilt_mult_now
+float ctxMultS2 = ctxMultS * hod_mult_now * tilt_mult_now
+string pickMethL = ""
+float  pickScL   = 0.0
+string pickMethS = ""
+float  pickScS   = 0.0
+
+float bestL = na
+if sigInsideL
+    float sc = methodScore("Inside") * ctxMultL2
+    if na(bestL) or sc > bestL
+        bestL := sc
+        pickScL := sc
+        pickMethL := "Inside"
+if sigEngulfL
+    float sc2 = methodScore("Engulf") * ctxMultL2
+    if na(bestL) or sc2 > bestL
+        bestL := sc2
+        pickScL := sc2
+        pickMethL := "Engulf"
+if sigDonL
+    float sc3 = methodScore("Don") * ctxMultL2
+    if na(bestL) or sc3 > bestL
+        bestL := sc3
+        pickScL := sc3
+        pickMethL := "Don"
+if sigContL
+    float sc4 = methodScore("Cont") * ctxMultL2
+    if na(bestL) or sc4 > bestL
+        bestL := sc4
+        pickScL := sc4
+        pickMethL := "Cont"
+if sigVWAPL
+    float sc5 = methodScore("VWAP") * ctxMultL2
+    if na(bestL) or sc5 > bestL
+        bestL := sc5
+        pickScL := sc5
+        pickMethL := "VWAP"
+if sigORL
+    float sc6 = methodScore("OR") * ctxMultL2
+    if na(bestL) or sc6 > bestL
+        bestL := sc6
+        pickScL := sc6
+        pickMethL := "OR"
+if sigRSIL
+    float sc7 = methodScore("RSIDiv") * ctxMultL2
+    if na(bestL) or sc7 > bestL
+        bestL := sc7
+        pickScL := sc7
+        pickMethL := "RSIDiv"
+if sigRangeRetL
+    float sc8 = methodScore("RangeRet") * ctxMultL2
+    if na(bestL) or sc8 > bestL
+        bestL := sc8
+        pickScL := sc8
+        pickMethL := "RangeRet"
+if sigBOPBL
+    float sc9 = methodScore("BOPB") * ctxMultL2
+    if na(bestL) or sc9 > bestL
+        bestL := sc9
+        pickScL := sc9
+        pickMethL := "BOPB"
+if sigLW96L
+    float sc10 = methodScore("LW96") * ctxMultL2
+    if na(bestL) or sc10 > bestL
+        bestL := sc10
+        pickScL := sc10
+        pickMethL := "LW96"
+if sigORFadeL
+    float sc11 = methodScore("ORFade") * ctxMultL2
+    if na(bestL) or sc11 > bestL
+        bestL := sc11
+        pickScL := sc11
+        pickMethL := "ORFade"
+if sig2BarL
+    float sc12 = methodScore("TwoBar") * ctxMultL2
+    if na(bestL) or sc12 > bestL
+        bestL := sc12
+        pickScL := sc12
+        pickMethL := "TwoBar"
+if sigBOSContL
+    float sc13 = methodScore("BOSCont") * ctxMultL2
+    if na(bestL) or sc13 > bestL
+        bestL := sc13
+        pickScL := sc13
+        pickMethL := "BOSCont"
+if sigADXL
+    float scADX = methodScore("ADX") * ctxMultL2
+    if na(bestL) or scADX > bestL
+        bestL := scADX
+        pickScL := scADX
+        pickMethL := "ADX"
+
+if sigRSIFL
+    float scRSIFS = methodScore("RSIFS") * ctxMultL2
+    if na(bestL) or scRSIFS > bestL
+        bestL := scRSIFS
+        pickScL := scRSIFS
+        pickMethL := "RSIFS"
+
+if sigConfluL
+    float scCon = methodScore("Conflu") * ctxMultL2
+    if na(bestL) or scCon > bestL
+        bestL := scCon
+        pickScL := scCon
+        pickMethL := "Conflu"
+
+if sigATRXL
+    float scATRX = methodScore("ATRexp") * ctxMultL2
+    if na(bestL) or scATRX > bestL
+        bestL := scATRX
+        pickScL := scATRX
+        pickMethL := "ATRexp"
+float bestS = na
+if sigInsideS
+    float scS1 = methodScore("Inside") * ctxMultS2
+    if na(bestS) or scS1 > bestS
+        bestS := scS1
+        pickScS := scS1
+        pickMethS := "Inside"
+if sigEngulfS
+    float scS2 = methodScore("Engulf") * ctxMultS2
+    if na(bestS) or scS2 > bestS
+        bestS := scS2
+        pickScS := scS2
+        pickMethS := "Engulf"
+if sigDonS
+    float scS3 = methodScore("Don") * ctxMultS2
+    if na(bestS) or scS3 > bestS
+        bestS := scS3
+        pickScS := scS3
+        pickMethS := "Don"
+if sigContS
+    float scS4 = methodScore("Cont") * ctxMultS2
+    if na(bestS) or scS4 > bestS
+        bestS := scS4
+        pickScS := scS4
+        pickMethS := "Cont"
+if sigVWAPS
+    float scS5 = methodScore("VWAP") * ctxMultS2
+    if na(bestS) or scS5 > bestS
+        bestS := scS5
+        pickScS := scS5
+        pickMethS := "VWAP"
+if sigORS
+    float scS6 = methodScore("OR") * ctxMultS2
+    if na(bestS) or scS6 > bestS
+        bestS := scS6
+        pickScS := scS6
+        pickMethS := "OR"
+if sigRSIS
+    float scS7 = methodScore("RSIDiv") * ctxMultS2
+    if na(bestS) or scS7 > bestS
+        bestS := scS7
+        pickScS := scS7
+        pickMethS := "RSIDiv"
+if sigRangeRetS
+    float scS8 = methodScore("RangeRet") * ctxMultS2
+    if na(bestS) or scS8 > bestS
+        bestS := scS8
+        pickScS := scS8
+        pickMethS := "RangeRet"
+if sigBOPBS
+    float scS9 = methodScore("BOPB") * ctxMultS2
+    if na(bestS) or scS9 > bestS
+        bestS := scS9
+        pickScS := scS9
+        pickMethS := "BOPB"
+if sigLW96S
+    float scS10 = methodScore("LW96") * ctxMultS2
+    if na(bestS) or scS10 > bestS
+        bestS := scS10
+        pickScS := scS10
+        pickMethS := "LW96"
+if sigORFadeS
+    float scS11 = methodScore("ORFade") * ctxMultS2
+    if na(bestS) or scS11 > bestS
+        bestS := scS11
+        pickScS := scS11
+        pickMethS := "ORFade"
+if sig2BarS
+    float scS12 = methodScore("TwoBar") * ctxMultS2
+    if na(bestS) or scS12 > bestS
+        bestS := scS12
+        pickScS := scS12
+        pickMethS := "TwoBar"
+if sigBOSContS
+    float scS13 = methodScore("BOSCont") * ctxMultS2
+    if na(bestS) or scS13 > bestS
+        bestS := scS13
+        pickScS := scS13
+        pickMethS := "BOSCont"
+if sigADXS
+    float scADXs = methodScore("ADX") * ctxMultS2
+    if na(bestS) or scADXs > bestS
+        bestS := scADXs
+        pickScS := scADXs
+        pickMethS := "ADX"
+
+if sigRSIFS
+    float scRSIFSs = methodScore("RSIFS") * ctxMultS2
+    if na(bestS) or scRSIFSs > bestS
+        bestS := scRSIFSs
+        pickScS := scRSIFSs
+        pickMethS := "RSIFS"
+
+if sigConfluS
+    float scCons = methodScore("Conflu") * ctxMultS2
+    if na(bestS) or scCons > bestS
+        bestS := scCons
+        pickScS := scCons
+        pickMethS := "Conflu"
+
+if sigATRXS
+    float scATRXs = methodScore("ATRexp") * ctxMultS2
+    if na(bestS) or scATRXs > bestS
+        bestS := scATRXs
+        pickScS := scATRXs
+        pickMethS := "ATRexp"
+bool hasMethL = pickMethL != ""
+bool hasMethS = pickMethS != ""
+bool passScoreL = (not useScoreCut) or (pickScL >= scoreMinCut)
+bool passScoreS = (not useScoreCut) or (pickScS >= scoreMinCut)
+
+
+// ===== ZIGZAG-REVERSÃO v3 (módulo único) =====
+bool  az_enable               = input.bool(true,  "AZR: Ativar ZigZag/Reversão v3", group="AZR")
+int   az_min_bars_hold        = input.int(3,      "AZR: Mín. barras no lado antes de trocar", minval=0, group="AZR")
+int   az_cooldown_bars        = input.int(6,      "AZR: Cooldown em barras após trocar", minval=0, group="AZR")
+int   az_di_len               = input.int(14,     "AZR: DI len (força direcional)", minval=2, group="AZR")
+float az_min_force            = input.float(0.15, "AZR: Força direcional mínima (0–1)", minval=0.0, maxval=1.0, step=0.01, group="AZR")
+float az_delta_force          = input.float(0.20, "AZR: Delta de força vs lado anterior (0–1)", minval=0.0, maxval=1.0, step=0.01, group="AZR")
+int   az_slope_fast           = input.int(5,      "AZR: EMA rápida p/ inclinação", minval=1, group="AZR")
+int   az_slope_slow           = input.int(20,     "AZR: EMA lenta p/ inclinação",  minval=2, group="AZR")
+float az_min_slope_pct        = input.float(0.001,"AZR: Mín. inclinação relativa (ex.: 0.001=0.10%)", minval=0.0, step=0.0001, group="AZR")
+int   az_min_ticks_gap        = input.int(8,      "AZR: Distância mínima em ticks do último entry", minval=0, group="AZR")
+// 4.4 — Exigir rompimento de estrutura recente (opcional)
+bool az_useStruct = input.bool(true, "AZR: exigir rompimento de estrutura", group="AZR")
+int  az_structLen = input.int(5, "AZR: janela da estrutura (barras)", minval=2, group="AZR")
+
+bool az_structOK_L = not az_useStruct or close > ta.highest(high, az_structLen)[1]
+bool az_structOK_S = not az_useStruct or close < ta.lowest(low,  az_structLen)[1]
+// ---- Estado interno ----
+var int   az_side            = 0            // 1=long, -1=short, 0=flat
+var int   az_lastEntryBar    = na           // memória da última troca/entrada
+var float az_lastEntryPrice  = na           // memória do preço da última entrada
+var float az_lastForce       = 0.0          // força do lado na última troca
+
+// ---- Métricas de força e inclinação ----
+int   _diLen   = math.max(1, az_di_len)
+float _upMove  = high - high[1]
+float _dnMove  = low[1]  - low
+float _pDM     = (_upMove > _dnMove and _upMove > 0) ? _upMove : 0.0
+float _mDM     = (_dnMove > _upMove and _dnMove > 0) ? _dnMove : 0.0
+float _atrW    = ta.atr(_diLen)
+float _pDMrma = ta.rma(_pDM, _diLen)
+float _mDMrma = ta.rma(_mDM, _diLen)
+float az_diP  = _atrW == 0.0 ? 0.0 : 100.0 * _pDMrma / _atrW
+float az_diM  = _atrW == 0.0 ? 0.0 : 100.0 * _mDMrma / _atrW
+float az_forceDir = (az_diP + az_diM == 0) ? 0.0 : math.abs(az_diP - az_diM) / (az_diP + az_diM)
+float az_emaF     = ta.ema(close, az_slope_fast)
+float az_emaS     = ta.ema(close, az_slope_slow)
+float az_slopePct = (az_emaS == 0.0) ? 0.0 : (az_emaF - az_emaS) / az_emaS
+bool  az_forceOk  = (az_forceDir >= az_min_force) and (math.abs(az_slopePct) >= az_min_slope_pct)
+
+// ---- Candidatos (reuso dos seus scores) ----
+bool az_candLong  = (pickScL > 0)
+bool az_candShort = (pickScS > 0)
+// AZR só considera candidatos que passam nos gates do lado
+az_candLong  := az_candLong  and passL_gates
+az_candShort := az_candShort and passS_gates
+// ---- Gates temporais e de preço ----
+bool az_holdOk     = na(az_lastEntryBar) or (bar_index - az_lastEntryBar >= az_min_bars_hold)
+bool az_cooldownOk = na(az_lastEntryBar) or (bar_index - az_lastEntryBar >= az_cooldown_bars)
+bool az_gapOk      = na(az_lastEntryPrice) or (math.abs(close - az_lastEntryPrice) / syminfo.mintick >= az_min_ticks_gap)
+bool az_deltaOk    = az_forceDir >= (az_lastForce + az_delta_force)
+
+// ---- Máquina de estados do lado ----
+if az_enable
+    if strategy.position_size == 0 and az_side != 0
+        az_side := 0
+    if az_side == 1 and az_candShort and az_holdOk and az_cooldownOk and az_forceOk and az_deltaOk and az_gapOk and az_structOK_S
+        az_side           := -1
+        az_lastEntryBar   := bar_index
+        az_lastEntryPrice := close
+        az_lastForce      := az_forceDir
+    if az_side == -1 and az_candLong and az_holdOk and az_cooldownOk and az_forceOk and az_deltaOk and az_gapOk and az_structOK_L
+        az_side           := 1
+        az_lastEntryBar   := bar_index
+        az_lastEntryPrice := close
+        az_lastForce      := az_forceDir
+    if az_side == 0
+        if az_candLong and az_forceOk and az_gapOk and az_structOK_L
+            az_side           := 1
+            az_lastEntryBar   := bar_index
+            az_lastEntryPrice := close
+            az_lastForce      := az_forceDir
+        if az_candShort and az_forceOk and az_gapOk and az_structOK_S
+            az_side           := -1
+            az_lastEntryBar   := bar_index
+            az_lastEntryPrice := close
+            az_lastForce      := az_forceDir
+
+// ---- Saídas do módulo (para AND nos seus gatilhos) ----
+bool az_allowLongFinal  = az_enable ? (az_side == 1)  : az_candLong
+bool az_allowShortFinal = az_enable ? (az_side == -1) : az_candShort
+// -----------------------------------------------------------------------------
+// ⑨ Sizer & Guard-Rails (fusão 55.007 + 59.003)
+// -----------------------------------------------------------------------------
+string gpSizer = "⑥ Sizer & Guard-Rail"
+bool   rw_use       = input.bool(true,  "RiskWeighted: gates ajustam quantidade", group=gpSizer)
+float  rw_min       = input.float(0.6,  "RiskWeighted: fator mín", step=0.05, group=gpSizer)
+float  rw_max       = input.float(1.6,  "RiskWeighted: fator máx", step=0.05, group=gpSizer)
+
+string gpATRreg = "⑥.a ATR Regime"
+bool  atrreg_use = input.bool(false, "Sizing por regime de ATR%", group=gpATRreg)
+float atrLow     = input.float(0.015, "ATR baixo (<)", step=0.001, group=gpATRreg)
+float atrHigh    = input.float(0.035, "ATR alto (≥)", step=0.001, group=gpATRreg)
+float qtdBaseRef = input.float(700.0, "Qtd base (referência)", minval=0.0, step=1.0, group=gpATRreg)
+float qtdLowVol  = input.float(300.0, "Qtd quando ATR baixo", minval=0.0, step=1.0, group=gpATRreg)
+float atr_pct    = atr14 / math.max(close, syminfo.mintick)
+float atr_mult   = 1.0
+if atrreg_use
+    if atr_pct < atrLow
+        atr_mult := qtdBaseRef > 0 ? clampf(qtdLowVol / qtdBaseRef, 0.01, 5.0) : 1.0
+    else
+        atr_mult := 1.0
+
+float  maxBoostPct   = input.float(20.0, "Permitir exceder máx em % se sinal forte", minval=0, step=5, group=gpSizer)
+
+// >>> coloque logo depois do picker (após definir pickMethL/pickMethS e pickScL/pickScS)
+bool isStrongMethodL = pickMethL=="Don" or pickMethL=="Inside" or pickMethL=="Cont" or pickMethL=="BOPB" or pickMethL=="RangeRet" or pickMethL=="LW96"
+bool isStrongMethodS = pickMethS=="Don" or pickMethS=="Inside" or pickMethS=="Cont" or pickMethS=="BOPB" or pickMethS=="RangeRet" or pickMethS=="LW96"
+isStrongMethodL := isStrongMethodL or pickMethL=="ADX" or pickMethL=="Conflu"
+isStrongMethodS := isStrongMethodS or pickMethS=="ADX" or pickMethS=="Conflu"
+// --- Políticas de mínimo/máximo & boosts por método ---
+string minQtyPolicy = input.string("BumpToMin", "Se < mínimo:", 
+     options=["Block","BumpToMin"], group=gpSizer)
+string maxQtyPolicy = input.string("Cap", "Se > máximo:", 
+     options=["Cap","Block","BoostIfMethod"], group=gpSizer)
+float  boostPctAll     = input.float(0.0, "Boost % (geral)", minval=0, step=1, group=gpSizer)
+float  boostPctLwDon   = input.float(10.0, "Boost % extra p/ LW9.6/Don", minval=0, step=1, group=gpSizer)
+// (opcional) limiar de score p/ "muito forte"
+float scoreStrongThresh = input.float(1.6, "Limiar de score p/ 'muito forte'", step=0.1, group=gpSizer)
+bool veryStrongL = strongL or isStrongMethodL or (pickScL >= scoreStrongThresh)
+bool veryStrongS = strongS or isStrongMethodS or (pickScS >= scoreStrongThresh)
+
+// Confirmação adicional: exige fechamento favorável, exceto se método muito forte
+bool needConfirmL = (pickMethL != "") and not veryStrongL
+bool needConfirmS = (pickMethS != "") and not veryStrongS
+bool confirmOK_L  = not needConfirmL or (close > open)   // candle fechou “a favor”
+bool confirmOK_S  = not needConfirmS or (close < open)
+
+// Base qty por risco (cash) com proteção
+float pvSafe = math.max(pv, 1.0)
+float stopDistCashBaseSafe = math.max(stopDistCashBase, syminfo.mintick*pvSafe)
+float rawBaseQty = stopDistCashBaseSafe > 0 ? (riskBRL / stopDistCashBaseSafe) : 0.0
+// Cap por ordem
+rawBaseQty := math.min(rawBaseQty, maxQtyPerOrder)
+// Round por passo
+float baseQty = round_to_step(rawBaseQty, lotStep)
+
+baseQty := round_to_step(baseQty * atr_mult, lotStep)
+
+// Se base=0, tentar 1 passo se o risco tolerar
+if allowForceMinLot and baseQty == 0
+    float cashRiskOneStep = stopDistCashBaseSafe * lotStep
+    float maxRiskAllow    = riskBRL * (1.0 + maxOverRiskPct/100.0)
+    if cashRiskOneStep <= maxRiskAllow
+        baseQty := lotStep
+
+// Midday throttle / block (aplicar sobre a base, antes do RW/multiplicadores)
+if inMidday and midMode=="Throttle"
+    float midEff = clampf(midThrottle * midAdj, 0.0, 1.0)
+    baseQty := round_to_step(baseQty * midEff, lotStep)
+if inMidday and midMode=="Block"
+    baseQty := 0.0
+
+// ===========================================================================
+// ⑨ Sizer 2.0 (confirmações → multiplicador robusto) + caps inteligentes
+// ===========================================================================
+string gpSizer2 = "⑥ Sizer & Guard-Rail (v60+)"
+float multWeak      = input.float(0.80, "Multiplicador quando fraco", step=0.05, group=gpSizer2)
+float multNeutral   = input.float(1.00, "Multiplicador neutro",      step=0.05, group=gpSizer2)
+float multStrong    = input.float(1.80, "Multiplicador quando forte",step=0.05, group=gpSizer2)
+float wGates = input.float(0.30, "Peso: Gates OK", step=0.05, group=gpSizer2)
+float wVWAP2 = input.float(0.20, "Peso: VWAP2 OK", step=0.05, group=gpSizer2)
+float wFP    = input.float(0.20, "Peso: Footprint pró", step=0.05, group=gpSizer2)
+float wSec   = input.float(0.10, "Peso: Setor pró", step=0.05, group=gpSizer2)
+float wMkt   = input.float(0.10, "Peso: Mercado pró", step=0.05, group=gpSizer2)
+float wGap   = input.float(0.10, "Peso: Gap pró", step=0.05, group=gpSizer2)
+float wMethodStrong = input.float(0.10, "Bônus: Método forte", step=0.05, group=gpSizer2)
+float wFactorMom    = input.float(0.15, "Bônus: Factor-Momentum (EMA)", step=0.05, group=gpSizer2)
+
+float qtyL = baseQty
+float qtyS = baseQty
+
+// RiskWeighted pelos gates
+if rw_use
+    float fL = rw_min + (rw_max - rw_min) * bonusLnorm
+    float fS = rw_min + (rw_max - rw_min) * bonusSnorm
+    qtyL := round_to_step(qtyL * fL, lotStep)
+    qtyS := round_to_step(qtyS * fS, lotStep)
+
+// --- Score de confirmações → multiplicador suave 0.8..1.8 --
+float scoreL_conf = 0.0
+float scoreS_conf = 0.0
+float wSum = wGates + wVWAP2 + wFP + wSec + wMkt + wGap
+
+scoreL_conf += (passL_gates ? wGates : 0)
+scoreS_conf += (passS_gates ? wGates : 0)
+scoreL_conf += (v2_okL ? wVWAP2 : 0)
+scoreS_conf += (v2_okS ? wVWAP2 : 0)
+scoreL_conf += ((fp_zDelta > 0 and fp_closePos > 0.5) ? wFP : 0)
+scoreS_conf += ((fp_zDelta < 0 and fp_closePos < 0.5) ? wFP : 0)
+scoreL_conf += (secAlignL ? wSec : 0)
+scoreS_conf += (secAlignS ? wSec : 0)
+scoreL_conf += (mktAlignL ? wMkt : 0)
+scoreS_conf += (mktAlignS ? wMkt : 0)
+scoreL_conf += (preGapAlignL ? wGap : 0)
+scoreS_conf += (preGapAlignS ? wGap : 0)
+
+// normaliza 0..1
+scoreL_conf := wSum > 0 ? clampf(scoreL_conf / wSum, 0.0, 1.0) : 0.5
+scoreS_conf := wSum > 0 ? clampf(scoreS_conf / wSum, 0.0, 1.0) : 0.5
+
+float wDaily = input.float(0.10, "Peso: Diário pró", step=0.05, group=gpSizer2)
+
+// ... logo após scoreL_conf += (preGapAlignL ? wGap : 0)
+scoreL_conf += (dayAlignL ? wDaily : 0)
+scoreS_conf += (dayAlignS ? wDaily : 0)
+
+// mapeia para [multWeak .. multStrong] com leve viés pela “força do método” e factor-momentum
+float methodKickL = isStrongMethodL ? wMethodStrong : 0.0
+float methodKickS = isStrongMethodS ? wMethodStrong : 0.0
+float momKickL    = wFactorMom * clampf(confEMA_L, 0.0, 1.0)
+float momKickS    = wFactorMom * clampf(confEMA_S, 0.0, 1.0)
+
+float scoreL_final = clampf(scoreL_conf + methodKickL + momKickL, 0.0, 1.0)
+float scoreS_final = clampf(scoreS_conf + methodKickS + momKickS, 0.0, 1.0)
+
+float multL = multWeak + (multStrong - multWeak) * scoreL_final
+float multS = multWeak + (multStrong - multWeak) * scoreS_final
+
+qtyL := round_to_step(qtyL * multL, lotStep)
+qtyS := round_to_step(qtyS * multS, lotStep)
+
+// --- Multiplicadores de contexto existentes (FP/VP/VWAP2 Weight) ---
+qtyL := round_to_step(qtyL * (fp_multL * vp_multL * v2_multL), lotStep)
+qtyS := round_to_step(qtyS * (fp_multS * vp_multS * v2_multS), lotStep)
+
+// Aplica o efeito Weight do AVWAP Multiâncora no lugar correto (depois do Sizer)
+qtyL := round_to_step(qtyL * avma_mult, lotStep)
+qtyS := round_to_step(qtyS * avma_mult, lotStep)
+
+// === Boosts dos novos gates quando em modo "Weight" ===
+if useYZ and yzMode=="Weight" and gYZ
+    qtyL := round_to_step(qtyL * (1.0 + yzWeightGain/100.0), lotStep)
+    qtyS := round_to_step(qtyS * (1.0 + yzWeightGain/100.0), lotStep)
+
+if useCUSUM and cusumMode=="Weight" and gCUSUM
+    qtyL := round_to_step(qtyL * (1.0 + cusumBoost/100.0), lotStep)
+    qtyS := round_to_step(qtyS * (1.0 + cusumBoost/100.0), lotStep)
+
+
+if tiltActive and tilt_modo == "Reduzir size"
+    qtyL := round_to_step(qtyL * tilt_sizeMult, lotStep)
+    qtyS := round_to_step(qtyS * tilt_sizeMult, lotStep)
+
+// --- Preferência de boost por método ---
+bool methIsLwDonL = (pickMethL=="LW96" or pickMethL=="Don")
+bool methIsLwDonS = (pickMethS=="LW96" or pickMethS=="Don")
+
+float boostL = boostPctAll + (methIsLwDonL ? boostPctLwDon : 0.0)
+float boostS = boostPctAll + (methIsLwDonS ? boostPctLwDon : 0.0)
+
+// --- Guard-rails mínimo ---
+if qtyL < minQtyPerTrade
+    if minQtyPolicy == "Block"
+        qtyL := 0
+    else
+        qtyL := ceil_to_step(minQtyPerTrade, lotStep)
+
+if qtyS < minQtyPerTrade
+    if minQtyPolicy == "Block"
+        qtyS := 0
+    else
+        qtyS := ceil_to_step(minQtyPerTrade, lotStep)
+
+// --- Guard-rails máximo (com opção de boost) ---
+float maxAllow = maxQtyPerOrder * (1.0 + maxBoostPct/100.0)
+// 1) primeiro, se configurado, aplicar boost
+if maxQtyPolicy == "BoostIfMethod"
+    qtyL := boost_qty(qtyL, boostL, lotStep)
+    qtyS := boost_qty(qtyS, boostS, lotStep)
+
+// 2) depois, tratar violação do máximo
+if qtyL > maxQtyPerOrder
+    if maxQtyPolicy == "Block"
+        qtyL := 0
+    else // "Cap" ou "BoostIfMethod"
+        qtyL := round_to_step(math.min(qtyL, maxAllow), lotStep)
+
+if qtyS > maxQtyPerOrder
+    if maxQtyPolicy == "Block"
+        qtyS := 0
+    else
+        qtyS := round_to_step(math.min(qtyS, maxAllow), lotStep)
+
+// 3) respeita passe no final (garantia)
+qtyL := round_to_step(qtyL, lotStep)
+qtyS := round_to_step(qtyS, lotStep)
+// Garantia final: respeita passo e mínimo (pós-caps/boosts)
+if qtyL > 0 and qtyL < minQtyPerTrade
+    qtyL := minQtyPolicy=="Block" ? 0 : ceil_to_step(minQtyPerTrade, lotStep)
+if qtyS > 0 and qtyS < minQtyPerTrade
+    qtyS := minQtyPolicy=="Block" ? 0 : ceil_to_step(minQtyPerTrade, lotStep)
+// reforço final de passo (defensivo)
+qtyL := qtyL>0 ? round_to_step(qtyL, lotStep) : 0
+qtyS := qtyS>0 ? round_to_step(qtyS, lotStep) : 0
+// --- Guard-rails (não corta para baixo do mínimo; cap com overcap opcional) ---
+if minQtyPolicy=="BumpToMin"
+    float minStep = ceil_to_step(minQtyPerTrade, lotStep)
+    if qtyL > 0
+        qtyL := math.max(qtyL, minStep)
+    if qtyS > 0
+        qtyS := math.max(qtyS, minStep)
+
+// overcap (ultrapassar máx em X% se sinal MUITO forte)
+float maxQtyAllow = maxQtyPerOrder * (1.0 + maxBoostPct/100.0)
+qtyL := veryStrongL ? math.min(qtyL, maxQtyAllow) : math.min(qtyL, maxQtyPerOrder)
+qtyS := veryStrongS ? math.min(qtyS, maxQtyAllow) : math.min(qtyS, maxQtyPerOrder)
+
+// respeita múltiplos do passo no final
+qtyL := round_to_step(qtyL, lotStep)
+qtyS := round_to_step(qtyS, lotStep)
+
+// Suavização leve (histerese) – opcional
+var float _qPrevL = na
+var float _qPrevS = na
+float _maxJump = 3.0 * lotStep
+if not na(_qPrevL)
+    qtyL := round_to_step(_qPrevL + clampf(qtyL - _qPrevL, -_maxJump, _maxJump), lotStep)
+if not na(_qPrevS)
+    qtyS := round_to_step(_qPrevS + clampf(qtyS - _qPrevS, -_maxJump, _maxJump), lotStep)
+_qPrevL := qtyL
+_qPrevS := qtyS
+
+
+// ----------------------------------------------------------------------------
+// ⑩ Guard-rail: ganho mínimo projetado (TPs)
+// -----------------------------------------------------------------------------
+int tp1PctEff = useTP1 ? (useTP2 ? tp1Percent : 100) : 0
+int tp2PctEff = useTP2 ? (100 - tp1PctEff) : 0
+tp1PctEff := int(clampf(tp1PctEff, 0, 100))
+tp2PctEff := int(clampf(tp2PctEff, 0, 100))
+
+f_takeProfit(bool isLong, int level) =>
+    qty = isLong ? qtyL : qtyS
+    pct = level == 1 ? tp1PctEff : tp2PctEff
+    useTP = level == 1 ? useTP1 : useTP2
+    useTP ? round_to_step(qty * pct / 100, lotStep) : 0.0
+
+float gainProjL = (tp1ProjL ? f_takeProfit(true, 1) * tp1ProjL : 0.0) +  (tp2ProjL ? f_takeProfit(true, 2) * tp2ProjL : 0.0)
+float gainProjS = (tp1ProjS ? f_takeProfit(false, 1) * tp1ProjS : 0.0) +  (tp2ProjS ? f_takeProfit(false, 2) * tp2ProjS : 0.0)
+
+// === PATCH E: Slippage-aware ===
+string gpSlip = "②.d Execução & Slippage"
+bool  slip_use   = input.bool(false, "Penalizar por slippage", group=gpSlip)
+string slip_mode = input.string("TightenMinGain", "Modo", options=["TightenMinGain","TightenBoth"], group=gpSlip)
+int   slipTicks  = input.int(2, "Custo por lado (ticks)", minval=0, group=gpSlip)
+float slipPct    = input.float(0.00, "Ou custo % (0 para ignorar)", minval=0, step=0.01, group=gpSlip)
+
+// custo monetário estimado por ENTRADA+SAÍDA (duas passagens)
+float slipPerSideCash = (slipTicks>0 ? (slipTicks*syminfo.mintick*pv) : 0.0) + (slipPct>0 ? (close*slipPct/100.0)*pv : 0.0)
+float slipRoundTrip   = 2.0 * slipPerSideCash
+
+// Ajuste “TightenBoth”
+if slip_use and slip_mode=="TightenBoth"
+    float adj = slipPerSideCash/pv
+    // 1) Aperta o STOP em preço...
+    stopDistPriceBase := math.max(stopDistPriceBase - adj, syminfo.mintick)
+    //    ...e mantém o CASH coerente
+    stopDistCashBase  := stopDistPriceBase * pv
+
+    // 2) Micro-bônus de R **sem** tocar no input:
+    tp1R_base_eff := tp1R_base + 0.05
+
+// reavalia RR projetado com os valores ajustados
+float _t1R_now_afterSlip = tp1R_calc(tp1R_base_eff)
+rrProj := stopDistCashBase > 0 ? _t1R_now_afterSlip : na
+rrOK   := (not rr_use) or (not na(rrProj) and rrProj >= rr_min)
+
+// aplica na projeção de ganho
+float gainProjL_adj = slip_use ? math.max(gainProjL - slipRoundTrip, 0.0) : gainProjL
+float gainProjS_adj = slip_use ? math.max(gainProjS - slipRoundTrip, 0.0) : gainProjS
+
+// === Robustez regime-aware (ATR% e RVOL aumentam a exigência) ===
+float dynMinGain = mg_minGain * (1 + (atrPct/100.0)*0.5) * (1 + math.max(rvol - 1.0, 0.0) * 0.3)
+bool gainOK_L = (not mg_use) or (qtyL > 0 and gainProjL_adj >= dynMinGain)
+bool gainOK_S = (not mg_use) or (qtyS > 0 and gainProjS_adj >= dynMinGain)
+
+// Reinit por barra (evita "ficar travado" de barras anteriores)
+allowCoreL := true
+allowCoreS := true
+
+// -----------------------------------------------------------------------------
+// ⑪ Permissões finais (tempo/sessão/diários/gates/score/blocks/1 por barra)
+// -----------------------------------------------------------------------------
+// ⑪ Permissões finais — separar núcleo de sinal do envio de ordem
+bool blockSameBar  = not sameBarEntries
+bool coreMaskTime  = inSession and (not timeToFlat) and delayGate
+
+// Núcleo sem dependência de allowOrders (para INDICADOR e ALERTAS)
+bool coreMaskCore  = coreMaskTime and not inCooldown and not hitMaxLoss and not overDayTrades and not overRolling and not inSoftPause
+
+// Versão antiga que bloqueava tudo no modo Produção
+bool coreMask     = coreMaskTime and not inCooldown and not hitMaxLoss and not overDayTrades
+
+// === Bloqueios dos novos gates (modo "Block") ===
+bool yzBlockL   = useYZ   and yzMode   == "Block" and not gYZ
+bool yzBlockS   = useYZ   and yzMode   == "Block" and not gYZ
+bool cusBlockL  = useCUSUM and cusumMode=="Block" and not gCUSUM
+bool cusBlockS  = useCUSUM and cusumMode=="Block" and not gCUSUM
+
+allowCoreL := allowCoreL and not (yzBlockL or cusBlockL or hod_block_now)
+allowCoreS := allowCoreS and not (yzBlockS or cusBlockS or hod_block_now)
+allowCoreL := allowCoreL and not avmaBlockNow
+allowCoreS := allowCoreS and not avmaBlockNow
+// Opcional: hard block quando CHOP muito alto e ATR% muito baixo
+bool antiRangeHard = (chop > 65) and (atrPct < 0.35)
+allowCoreL := allowCoreL and not antiRangeHard
+allowCoreS := allowCoreS and not antiRangeHard
+
+if sideMode == "LongOnly"
+    allowCoreS := false
+if sideMode == "ShortOnly"
+    allowCoreL := false
+
+// Bloqueios FP/VP/VWAP2 (aplicam em ambos)
+if fpBlockL_final or vpBlockL or v2BlockL
+    allowCoreL := false
+if fpBlockS_final or vpBlockS or v2BlockS
+    allowCoreS := false
+
+// ----- núcleo de tempo/limites já prontos no seu código -----
+bool coreOK = inSession and not timeToFlat and delayGate
+coreOK := coreOK and not inCooldown and not hitMaxLoss and not overDayTrades and not overRolling and not inSoftPause
+
+bool hodBlockEntries = hod_use and hod_block_now
+coreOK := coreOK and not hodBlockEntries
+
+// ----- pronto por lado (inclui Gates + MinGain/RR + método + score) -----
+bool longReady  = coreOK and allowCoreL and passL_gates and confirmOK_L and ((not mg_use) or gainOK_L) and ((not rr_use) or rrOK) and hasMethL and ((not useScoreCut) or passScoreL)
+bool shortReady = coreOK and allowCoreS and passS_gates and confirmOK_S and ((not mg_use) or gainOK_S) and ((not rr_use) or rrOK) and hasMethS and ((not useScoreCut) or passScoreS)
+
+bool tiltBlock = tiltActive and tilt_modo == "Bloquear novas entradas"
+longReady  := longReady  and not tiltBlock
+shortReady := shortReady and not tiltBlock
+
+longReady  := longReady  and setOK_L
+shortReady := shortReady and setOK_S
+
+// ==== Sanity LOCK: respeitar passo (lotStep) antes de enviar ====
+float qL_send = round_to_step(qtyL, lotStep)
+float qS_send = round_to_step(qtyS, lotStep)
+
+//-------------------------------------------------------------------------
+// ⑫ Execução (Entradas / Addon / Saídas com IDs explícitos)
+// -----------------------------------------------------------------------------
+const string ID_LE     = "LE"
+const string ID_LE_TP1 = "LE_TP1"
+const string ID_LE_TP2 = "LE_TP2"
+const string ID_LE_SL  = "LE_SL"
+const string ID_SE     = "SE"
+const string ID_SE_TP1 = "SE_TP1"
+const string ID_SE_TP2 = "SE_TP2"
+const string ID_SE_SL  = "SE_SL"
+
+// ==== One-entry arbiter (core + gates + score + desempate) ====
+bool sameBar = (not na(lastEntryBar)) and (bar_index == lastEntryBar)
+bool canEnterThisBar = canSendThisBar
+
+bool candL = longReady
+bool candS = shortReady
+
+candL := candL and az_allowLongFinal
+candS := candS and az_allowShortFinal
+
+// Desempate por score somente se ambos elegíveis
+if candL and candS
+    bool chooseL = na(pickScS) or (not na(pickScL) and pickScL >= pickScS)
+    if chooseL
+        candS := false
+    else
+        candL := false
+
+bool posL = strategy.position_size > 0
+bool posS = strategy.position_size < 0
+if posS and candL
+    candL := rev_use and revOK_L
+if posL and candS
+    candS := rev_use and revOK_S
+
+// Entradas (um único envio por barra)
+if allowOrders and candL and canSendNow and (qL_send > 0)
+    _seqToday += 1
+    mark_send()
+    _curCode := build_code_from_ms(_lastSendMs)
+    strategy.entry(ID_LE, strategy.long,  qty=qL_send, comment=pickMethL)
+    lastEntryBar := bar_index
+    lastSendBar  := bar_index
+    canSendNow   := false
+
+if allowOrders and candS and canSendNow and (qS_send > 0)
+    _seqToday += 1
+    mark_send()
+    _curCode := build_code_from_ms(_lastSendMs)
+    strategy.entry(ID_SE, strategy.short, qty=qS_send, comment=pickMethS)
+    lastEntryBar := bar_index
+    lastSendBar  := bar_index
+    canSendNow   := false
+
+var bool _hadPosPrev = false
+bool _openedNow = (strategy.position_size != 0 and not _hadPosPrev)  // transição flat → posicionado
+
+// Intenção de entrada (pré-envio) — usa seus sinais finais
+bool enterLongIntent  = candL and canSendNow and (qL_send > 0)
+bool enterShortIntent = candS and canSendNow and (qS_send > 0)
+
+// Evento de abertura efetiva (pós-fill)
+if _openedNow
+    array.push(entryTimes, int(time))
+    tradesToday += 1
+    _entryAvg := strategy.position_avg_price
+    _sentEntry := true
+    _entryMs   := clockMs()
+    _entryQty  := math.abs(strategy.position_size)
+    _entrySide := strategy.position_size > 0 ? "LONG" : "SHORT"
+
+// Atualiza o estado intrabar no final
+_hadPosPrev := (strategy.position_size != 0)
+
+// Addon (sinal forte + PnL do dia ≥ k×R, respeita pyramiding/contagem)
+string gpAdd = "⑨.b Addon (só em sinal forte)"
+bool  addon_use = input.bool(false, "Usar Addon forte", group=gpAdd)
+float addon_dayPnL_R = input.float(2.5, "Liberar se PnL do dia ≥ k×R", minval=0.0, step=0.1, group=gpAdd)
+string addon_qty_mode = input.string("LotStep", "Qtd do Addon", options=["LotStep","BaseQtyUnit"], group=gpAdd)
+int    addon_maxAdds  = input.int(3, "Máx addons por posição", minval=0, group=gpAdd)
+var int addonCount = 0
+var int _lastAddonBar = -1
+int pyrMaxCheck = input.int(3, "Pyramiding (p/ checagem do Addon)", minval=0, group=gpAdd,
+     tooltip="Repita aqui o mesmo valor definido no cabeçalho strategy(..., pyramiding=X, ...)")
+if ta.change(time("D")) != 0
+    addonCount := 0
+
+// ===== Addon: regras e quantidade =====
+bool  addonAllowed = false
+float addonQty     = 0.0
+
+if addon_use
+    bool dayOK   = profitToday >= addon_dayPnL_R * riskBRL
+    bool countOK = addonCount < addon_maxAdds
+    bool pyrOK   = (strategy.opentrades < pyrMaxCheck)
+    bool oneBarOK= (sameBarEntries or bar_index > _lastAddonBar) and (not onePerBar or canSendNow)
+    addonQty     := addon_qty_mode == "LotStep" ? lotStep : baseQty
+    addonAllowed := dayOK and countOK and pyrOK and oneBarOK
+    
+// [ADDON-AUDIT]
+if addonAllowed
+    addonAllowed := addonAllowed and (sameBarEntries or bar_index > _lastAddonBar) and canSendNow
+
+// plot de diagnóstico
+plotshape(addonAllowed, title="ADDON allowed", style=shape.circle, location=location.top,
+     color=color.new(color.green, 0), size=size.tiny, text="ADDON")
+
+// trava para não enviar addon duas vezes no mesmo candle quando 1 por barra está desligado
+if not sameBarEntries and sameBar
+    addonAllowed := false
+
+// + canSendThisBar para respeitar 1 por candle
+addonAllowed := addonAllowed and (strategy.opentrades < pyrMaxCheck) and canSendNow
+if not sameBarEntries and sameBar
+    addonAllowed := false
+
+// Addon reusando a mesma tag de entrada
+if addonAllowed and strongL and strategy.position_size > 0
+    strategy.entry(ID_LE, strategy.long,  qty=addonQty, comment="ADD")
+    addonCount += 1
+    lastEntryBar := bar_index
+    lastSendBar  := bar_index
+    _lastAddonBar := bar_index
+    canSendNow := false
+
+if addonAllowed and strongS and strategy.position_size < 0
+    strategy.entry(ID_SE, strategy.short, qty=addonQty, comment="ADD")
+    addonCount += 1
+    lastEntryBar := bar_index
+    lastSendBar  := bar_index
+    _lastAddonBar := bar_index
+    canSendNow := false
+
+// ------------------------- Saídas e Proteções -------------------------------
+// Config extra para impedir “mesmo horário” (hold mínimo)
+string gpExitPlus = "②.c Regras extras de saída"
+bool  strictLotOnExits= input.bool(true,  "Ajustar TP1% para respeitar passo nas saídas", group=gpExitPlus)
+
+// Capturar idade da posição (sem reset por parcial/addon)
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    posEntryBar := na
+else if strategy.position_size != 0 and strategy.position_size[1] == 0
+    posEntryBar := bar_index
+
+// Reset fino dos alertas de manutenção (muda de lado)
+int _sideEffNow = allowOrders ? (strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0) : (_entrySide == "LONG" ? 1 : _entrySide == "SHORT" ? -1 : 0)
+if _sideEffNow != _lastSide
+    _sentMaint := false
+_lastSide := _sideEffNow
+
+int posAge = na(posEntryBar) ? 0 : (bar_index - posEntryBar)
+
+// TP/TP2 com base no preço de referência escolhido
+float basePxExec = ref_price(tpRefSrc, strategy.position_avg_price, close, strategy.position_size != 0)
+float tp1L = getTP1Price(true,  basePxExec)
+float tp2L = useTP2 ? getTP2Price(true,  basePxExec) : na
+float tp1S = getTP1Price(false, basePxExec)
+float tp2S = useTP2 ? getTP2Price(false, basePxExec) : na
+
+// Auxiliares consistentes
+float posQtyAbs = math.abs(strategy.position_size)
+float tp1PctAdj = tp1PctEff
+if strictLotOnExits and posQtyAbs > 0 and tp1PctEff > 0
+    float targetQ = round_to_step(posQtyAbs * (tp1PctEff/100.0), lotStep)
+    targetQ := clampf(targetQ, 0.0, posQtyAbs)
+    if posQtyAbs == 0
+        tp1PctAdj := 0.0
+    else
+        tp1PctAdj := (targetQ / posQtyAbs) * 100.0
+float qTP1  = round_to_step(posQtyAbs * (tp1PctAdj/100.0), lotStep)
+float qTP2  = round_to_step(posQtyAbs * math.max(0.0, (100.0 - tp1PctAdj)/100.0), lotStep)
+float tp2PctAdj = 100.0 - tp1PctAdj
+if tp2PctAdj < 0.0
+    tp2PctAdj := 0.0
+
+// STOP base vs XR (mais apertado prevalece)
+float avg = strategy.position_size != 0 ? strategy.position_avg_price : close
+float riskPerShareL = strategy.position_size != 0 ? (posQtyAbs > 0 ? (riskBRL/posQtyAbs) : 0.0) : (qL_send > 0 ? (riskBRL/qL_send) : 1e10)
+float riskPerShareS = strategy.position_size != 0 ? (posQtyAbs > 0 ? (riskBRL/posQtyAbs) : 0.0) : (qS_send > 0 ? (riskBRL/qS_send) : 1e10)
+float stopDistXR_L  = useXRiskStop ? (xRiskMult * (riskPerShareL / pvSafe)) : 1e10
+float stopDistXR_S  = useXRiskStop ? (xRiskMult * (riskPerShareS / pvSafe)) : 1e10
+float stopLong      = avg - math.min(stopDistPriceBase, stopDistXR_L)
+float stopShort     = avg + math.min(stopDistPriceBase, stopDistXR_S)
+
+// MinHold: TP/BE/Trail só após N barras
+bool okHoldTP = posAge >= minHoldBars
+bool okHoldStop = holdAffectsStop ? (posAge >= minHoldBars) : true
+
+// ===== EXECUÇÃO DE SAÍDAS (modo Backtest/Strategy) =====
+if allowOrders
+    if okStopExec and okHoldStop
+        strategy.exit(ID_LE_SL, from_entry=ID_LE, stop=stopLong)
+        strategy.exit(ID_SE_SL, from_entry=ID_SE, stop=stopShort)
+    if strategy.position_size > 0
+        if useTP1 and qTP1 > 0 and okTP1Exec and okTPBEFinal and not na(tp1L)
+            strategy.exit(ID_LE_TP1, from_entry=ID_LE, limit=tp1L, qty=qTP1)
+        if useTP2 and qTP2 > 0 and okTP1Exec and okTPBEFinal and not na(tp2L) and not extend_after_tp2
+            strategy.exit(ID_LE_TP2, from_entry=ID_LE, limit=tp2L, qty=qTP2)
+    if strategy.position_size < 0
+        if useTP1 and qTP1 > 0 and okTP1Exec and okTPBEFinal and not na(tp1S)
+            strategy.exit(ID_SE_TP1, from_entry=ID_SE, limit=tp1S, qty=qTP1)
+        if useTP2 and qTP2 > 0 and okTPBEFinal and not na(tp2S) and not extend_after_tp2
+            strategy.exit(ID_SE_TP2, from_entry=ID_SE, limit=tp2S, qty=qTP2)
+
+// ===== ESTADO EFETIVO P/ ALERTAS (Produção/Indicador) =====
+b(x)=> (x ? "true" : "false")
+num(x)=> na(x) ? "null" : str.tostring(x, format.mintick)
+
+atr_reg_tag(float ap,float limiar)=>ap>=limiar?"alta":"baixa"
+var int sideEff = 0
+
+// v60.002 — espelhos globais TP px/qty
+var float g_tp1_px  = na
+var float g_tp2_px  = na
+var float g_tp1_qty = na
+var float g_tp2_qty = na
+
+// JSON (mantida assinatura)
+//f_json_4082(string evento,string tipo,string metodo,string ativo,string exchange,string tf,float preco,float tp1,float tp2,float stopPx,float quantidade,float posQtyAtual,float posQtyRem,float tp1Pct,float tp2Pct,string codigo,string horaBR,float rr,string status,string versao)=>"{\"evento\":\""+evento+"\",\"tipo\":\""+tipo+"\",\"metodo\":\""+chooses(metodo=="","core",metodo)+"\",\"continuacao\":"+b(mCont_on)+",\"ativo\":\""+ativo+"\",\"exchange\":\""+exchange+"\",\"tf\":\""+tf+"\",\"preco\":"+num(preco)+",\"tp1\":"+num(tp1)+",\"tp2\":"+num(tp2)+",\"qtdtp1\":"+num(g_tp1_qty)+",\"qtdtp2\":"+num(g_tp2_qty)+",\"stop\":"+num(stopPx)+",\"quantidade\":"+num(quantidade)+",\"codigo\":\""+codigo+"\",\"hora_envio_br\":\""+horaBR+"\",\"rr\":"+num(rr)+",\"status\":\""+status+"\",\"versao\":\""+versao+"\",\"trendState\":\""+trend_tag()+"\",\"atrRegime\":\""+atr_reg_tag(atr_pct,atrLow)+"\",\"janela\":\""+hod_tag+"\",\"posSideBefore\":\""+chooses(sideEff>0,"long",chooses(sideEff<0,"short","none"))+"\",\"metodo_tag\":\""+chooses(metodo=="","core",metodo)+"\",\"cfg\":{\"pos\":{\"qty_atual\":"+num(posQtyAtual)+",\"qty_rem_evento\":"+num(posQtyRem)+",\"passo\":"+num(lotStep)+"},\"geral\":{\"allowLong\":"+b(sideMode!="ShortOnly")+",\"allowShort\":"+b(sideMode!="LongOnly")+"},\"metodos\":{\"Inside\":"+b(mInside_on)+",\"Engulf\":"+b(mEngulf_on)+",\"Don\":"+b(mDon_on)+",\"Cont\":"+b(mCont_on)+"},\"limits\":{\"cooldownBars\":"+num(cooldownBars)+",\"maxTradesDay\":"+num(tradesMaxDia)+"},\"exits\":{\"tp1_pct\":"+num(tp1Pct)+",\"tp2_pct\":"+num(tp2Pct)+"}}}"
+f_json_4082(string evento,string tipo,string metodo,string ativo,string exchange,string tf,float preco,float tp1,float tp2,float stopPx,float quantidade,float posQtyAtual,float posQtyRem,float tp1Pct,float tp2Pct,string codigo,string horaBR,float rr,string status,string versao)=>"{\"evento\":\""+evento+"\",\"tipo\":\""+tipo+"\",\"metodo\":\""+chooses(metodo=="","core",metodo)+"\",\"continuacao\":"+b(mCont_on)+",\"ativo\":\""+ativo+"\",\"exchange\":\""+exchange+"\",\"tf\":\""+tf+"\",\"preco\":"+num(preco)+",\"tp1\":"+num(tp1)+",\"tp2\":"+num(tp2)+",\"qtdtp1\":"+num(g_tp1_qty)+",\"qtdtp2\":"+num(g_tp2_qty)+",\"stop\":"+num(stopPx)+",\"quantidade\":"+num(quantidade)+",\"codigo\":\""+codigo+"\",\"hora_envio_br\":\""+horaBR+"\",\"rr\":"+num(rr)+",\"status\":\""+status+"\",\"versao\":\""+versao+"\",\"trendState\":\""+trend_tag()+"\",\"atrRegime\":\""+atr_reg_tag(atr_pct,atrLow)+"\",\"janela\":\""+hod_tag+"\",\"posSideBefore\":\""+chooses(sideEff>0,"long",chooses(sideEff<0,"short","none"))+"\",\"metodo_tag\":\""+chooses(metodo=="","core",metodo)+"\"}"
+// Anti-colisão “tipo” para chave (compra/venda)
+int sideKey = 0
+if allowOrders
+    if strategy.position_size > 0
+        sideKey := 1
+    else
+        if strategy.position_size < 0
+            sideKey := -1
+        else
+            sideKey := 0
+else
+    if _entrySide == "LONG"
+        sideKey := 1
+    else
+        if _entrySide == "SHORT"
+            sideKey := -1
+        else
+            sideKey := 0
+string tipoKey = ""
+if sideKey > 0
+    tipoKey := "compra"
+else
+    if sideKey < 0
+        tipoKey := "venda"
+    else
+        tipoKey := ""
+
+// Efetivo p/ produção
+bool  hasPosEff = allowOrders ? (strategy.position_size != 0) : (_sentEntry and _entryQty > 0 and not na(_entryAvg))
+sideEff := allowOrders ? (strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0) : (_entrySide == "LONG" ? 1 : _entrySide == "SHORT" ? -1 : 0)
+float avgEff    = allowOrders ? strategy.position_avg_price : _entryAvg
+float qtyEff    = allowOrders ? math.abs(strategy.position_size) : _entryQty
+bool  qtyEffOk  = qtyEff >= (lotStep - 1e-6)
+
+float basePxExecEff = (tpRefSrc == "AvgPrice" and hasPosEff) ? avgEff : close
+float tp1L_eff      = getTP1Price(true,  basePxExecEff)
+float tp2L_eff      = useTP2 ? getTP2Price(true,  basePxExecEff) : na
+float tp1S_eff      = getTP1Price(false, basePxExecEff)
+float tp2S_eff      = useTP2 ? getTP2Price(false, basePxExecEff) : na
+
+float riskPerShareEff    = qtyEff > 0 ? (riskBRL / qtyEff) : 0.0
+float stopDistPriceXREff = useXRiskStop ? (xRiskMult * (riskPerShareEff / pv)) : 1e10
+float stopLong_eff       = avgEff - math.min(stopDistPriceBase, stopDistPriceXREff)
+float stopShort_eff      = avgEff + math.min(stopDistPriceBase, stopDistPriceXREff)
+
+// === PREP (BE/Trail): calcular trailNow_eff ANTES de montar as mensagens ===
+float bePxEffL = avgEff + beOffsetATRx * atr14
+float bePxEffS = avgEff - beOffsetATRx * atr14
+
+float trailNow_eff = na
+if      sideEff > 0
+    trailNow_eff := math.max(bePxEffL, avgEff + trailATRx * atr14)
+else if sideEff < 0
+    trailNow_eff := math.min(bePxEffS, avgEff - trailATRx * atr14)
+// (se sideEff==0 mantém-se 'na')
+
+// "tipo" padrão para SAÍDAS (venda se long, compra se short)
+string _tipoExit = exit_tipo(sideEff)
+// Hora a usar em TODOS os alertas pós-entrada (preferir a hora da entrada)
+string _horaBase = na(_entryMs) ? hora_envio_br(_lastSendMs) : hora_envio_br(_entryMs)
+float _tpR_eff = tp1R_calc(tp1R_base_eff)
+
+bool hasPosEffStrict = allowOrders    ? (strategy.position_size != 0)   : (_sentEntry and _entryQty > 0 and not na(_entryAvg))
+
+var string _lastMeth = ""
+
+string _metodoCut = (_lastMeth != "" ? _lastMeth : "core")
+float  _tp1Cut    = sideEff > 0 ? tp1L_eff : tp1S_eff
+float  _tp2Cut    = sideEff > 0 ? tp2L_eff : tp2S_eff
+float  _slCut     = sideEff > 0 ? stopLong_eff : stopShort_eff
+string _msgCutoff = f_json_4082("saida_forcada", _tipoExit, _metodoCut, syminfo.ticker, syminfo.prefix, timeframe.period, close, _tp1Cut, _tp2Cut, _slCut, qtyEff, qtyEff, 0.0, tp1PctAdj, tp2PctAdj,  _curCode, (na(_entryMs) ? hora_envio_br(_lastSendMs) : hora_envio_br(_entryMs)),  tp1R_calc(tp1R_base_eff), "OK", VERSION)
+
+if timeToFlat and hasPosEffStrict and canSendNow and useDayFlatAlert and okCutoffExec
+    alert(_msgCutoff, alert.freq_once_per_bar)
+    lastSendBar := bar_index
+    canSendNow  := false
+
+
+// Gating p/ 1 por barra nos alertas
+bool _allowAlertNow = (not flatLocked) and (not onePerBar or canSendNow)
+
+// Memória do último método escolhido (global, visível a todo o script)
+
+// Condições de disparo (TP1, TP2, STOP)
+bool _tp1L = useTP1 and okTP1Exec and okTPBEFinal and hasPosEffStrict and qtyEffOk and (sideEff>0) and not na(tp1L_eff) and high>=tp1L_eff and bar_index!=lastTp1AlertBarL and _allowAlertNow
+bool _tp1S = useTP1 and okTP1Exec and okTPBEFinal and hasPosEffStrict and qtyEffOk and (sideEff<0) and not na(tp1S_eff) and low <=tp1S_eff and bar_index!=lastTp1AlertBarS and _allowAlertNow
+bool _tp2L = useTP2 and okTP1Exec and okTPBEFinal and hasPosEffStrict and qtyEffOk and (sideEff>0) and not na(tp2L_eff) and high>=tp2L_eff and bar_index!=lastTp2AlertBarL and _allowAlertNow
+bool _tp2S = useTP2 and okTP1Exec and okTPBEFinal and hasPosEffStrict and qtyEffOk and (sideEff<0) and not na(tp2S_eff) and low <=tp2S_eff and bar_index!=lastTp2AlertBarS and _allowAlertNow
+bool _slL  = okStopFinal and hasPosEffStrict and qtyEffOk and (sideEff>0)  and not na(stopLong_eff)  and low <=stopLong_eff  and bar_index!=lastStopAlertBarL and _allowAlertNow
+bool _slS  = okStopFinal and hasPosEffStrict and qtyEffOk and (sideEff<0)  and not na(stopShort_eff) and high>=stopShort_eff and bar_index!=lastStopAlertBarS and _allowAlertNow
+
+// Memória último método escolhido
+if candL and longReady
+    _lastMeth := pickMethL
+if candS and shortReady
+    _lastMeth := pickMethS
+if (_slL or _slS) and (_lastMeth == "Cont")
+    cont_failDay := cont_failDay + 1
+
+// Helpers qty p/ alerts (contexto efetivo) 
+safeQty(float want, float pos, float step)=> round_to_step(clampf(want, 0.0, pos), step)
+float _posQ_eff     = qtyEff
+float _qTP1_eff     = round_to_step(_posQ_eff * (tp1PctAdj/100.0), lotStep)
+float _qTP2_eff     = round_to_step(_posQ_eff * math.max(0.0, (100.0 - tp1PctAdj)/100.0), lotStep)
+float qTP1_qty      = safeQty(_qTP1_eff, _posQ_eff, lotStep)
+float qTP2_qty      = safeQty(math.max(_posQ_eff - qTP1_qty, 0.0), _posQ_eff, lotStep)
+if qTP2_qty < lotStep
+    qTP2_qty := 0.0
+    qTP1_qty := safeQty(_posQ_eff, _posQ_eff, lotStep)
+g_tp1_qty := qTP1_qty
+g_tp2_qty := qTP2_qty
+g_tp1_px  := sideEff>0 ? tp1L_eff : tp1S_eff
+g_tp2_px  := sideEff>0 ? tp2L_eff : tp2S_eff
+
+// Pré-cálculo de TPs com base no close atual (executa toda barra)
+float _tp1L_now = getTP1Price(true,  close)
+float _tp2L_now = useTP2 ? getTP2Price(true,  close) : na
+float _tp1S_now = getTP1Price(false, close)
+float _tp2S_now = useTP2 ? getTP2Price(false, close) : na
+
+// ===== ENTRADA (modo Produção/Indicador) — simula fill e alerta =====
+bool _entryTrigL = (not allowOrders) and candL and canSendNow and (qL_send > 0) and okEntryExec
+bool _entryTrigS = (not allowOrders) and candS and canSendNow and (qS_send > 0) and okEntryExec
+
+// Parâmetros já existentes no seu código
+float _riskPerShareEntL = qL_send > 0 ? (riskBRL / qL_send) : 0.0
+float _riskPerShareEntS = qS_send > 0 ? (riskBRL / qS_send) : 0.0
+float _stopXR_L = useXRiskStop ? (xRiskMult * (_riskPerShareEntL / pv)) : 1e10
+float _stopXR_S = useXRiskStop ? (xRiskMult * (_riskPerShareEntS / pv)) : 1e10
+float _stopL_ent = close - math.min(stopDistPriceBase, _stopXR_L)
+float _stopS_ent = close + math.min(stopDistPriceBase, _stopXR_S)
+
+// Mensagens pré-montadas (executa toda barra)
+string _msgEntryL = f_json_4082("entrada", "compra", pickMethL, syminfo.ticker, syminfo.prefix, timeframe.period,    close, _tp1L_now, _tp2L_now, _stopL_ent, qL_send, qL_send, qL_send,   tp1PctAdj, 100.0 - tp1PctAdj, _curCode, hora_envio_br(_lastSendMs),        _tpR_eff, "OK", VERSION)
+string _msgEntryS = f_json_4082("entrada", "venda",  pickMethS, syminfo.ticker, syminfo.prefix, timeframe.period,     close, _tp1S_now, _tp2S_now, _stopS_ent, qS_send, qS_send, qS_send,    tp1PctAdj, 100.0 - tp1PctAdj, _curCode, hora_envio_br(_lastSendMs),    _tpR_eff, "OK", VERSION)
+
+
+// ===== ENTRADA (modo Produção/Indicador) =====
+if _entryTrigL
+    _seqToday += 1
+    mark_send()
+    _curCode    := build_code_from_ms(_lastSendMs)
+    _entryAvg   := close
+    _entryQty   := qL_send
+    _entrySide  := "LONG"
+    _sentEntry  := true
+    _entryMs    := clockMs()
+    lastEntryBar:= bar_index
+    lastSendBar := bar_index
+    canSendNow  := false
+    sideEff     := 1
+    alert(_msgEntryL, alert.freq_once_per_bar)
+
+if _entryTrigS
+    _seqToday   += 1
+    mark_send()
+    _curCode    := build_code_from_ms(_lastSendMs)
+    _entryAvg   := close
+    _entryQty   := qS_send
+    _entrySide  := "SHORT"
+    _sentEntry  := true
+    _entryMs    := clockMs()
+    lastEntryBar:= bar_index
+    lastSendBar := bar_index
+    canSendNow  := false
+    sideEff     := -1
+    alert(_msgEntryS, alert.freq_once_per_bar)
+
+// =================== MENSAGENS PRÉ-CALCULADAS (uma por barra) ===================
+string _msgMaint  = f_json_4082("manutencao", _tipoExit, (_lastMeth != "" ? _lastMeth : "core"),    syminfo.ticker, syminfo.prefix, timeframe.period,   close,   (sideEff>0?tp1L_eff:tp1S_eff),  (sideEff>0?tp2L_eff:tp2S_eff),   (sideEff>0?stopLong_eff:stopShort_eff),  qtyEff, qtyEff, 0.0,   tp1PctAdj, 100.0 - tp1PctAdj,   _curCode, _horaBase, _tpR_eff, "andamento", VERSION)
+
+// TP1 / TP2 / STOP
+string _msgTP1L   = f_json_4082("tp1","compra",_lastMeth, syminfo.ticker,syminfo.prefix,timeframe.period,   tp1L_eff, tp1L_eff, tp2L_eff, stopLong_eff,   qTP1_qty, qtyEff, math.max(qtyEff - qTP1_qty, 0.0),   tp1PctAdj, tp2PctAdj, _curCode, _horaBase, _tpR_eff, "parcial",    VERSION)
+
+string _msgTP1S   = f_json_4082("tp1","venda", _lastMeth, syminfo.ticker,syminfo.prefix,timeframe.period,  tp1S_eff, tp1S_eff, tp2S_eff, stopShort_eff,  qTP1_qty, qtyEff, math.max(qtyEff - qTP1_qty, 0.0),  tp1PctAdj, tp2PctAdj, _curCode, _horaBase, _tpR_eff, "parcial",    VERSION)
+
+string _msgTP2L   = f_json_4082("tp2","compra",_lastMeth, syminfo.ticker,syminfo.prefix,timeframe.period,   tp2L_eff, tp1L_eff, tp2L_eff, stopLong_eff,    qTP2_qty, qtyEff, 0.0,   tp1PctAdj, tp2PctAdj, _curCode, _horaBase, _tpR_eff, "fechamento", VERSION)
+
+string _msgTP2S   = f_json_4082("tp2","venda", _lastMeth, syminfo.ticker,syminfo.prefix,timeframe.period,   tp2S_eff, tp1S_eff, tp2S_eff, stopShort_eff,   qTP2_qty, qtyEff, 0.0,  tp1PctAdj, tp2PctAdj, _curCode, _horaBase, _tpR_eff, "fechamento", VERSION)
+
+string _msgStopL  = f_json_4082("stop","compra",_lastMeth, syminfo.ticker,syminfo.prefix,timeframe.period,   stopLong_eff, tp1L_eff, tp2L_eff, stopLong_eff,  qtyEff, qtyEff, 0.0,    tp1PctAdj, tp2PctAdj, _curCode, _horaBase, _tpR_eff, "fechamento", VERSION)
+
+string _msgStopS  = f_json_4082("stop","venda", _lastMeth, syminfo.ticker,syminfo.prefix,timeframe.period,  stopShort_eff, tp1S_eff, tp2S_eff, stopShort_eff,   qtyEff, qtyEff, 0.0,   tp1PctAdj, tp2PctAdj, _curCode, _horaBase, _tpR_eff, "fechamento", VERSION)
+
+// BE/Trail (padrão; usa trailNow_eff calculado fora de if)
+string _msgBE_now = f_json_4082("be_trail", (sideEff>0 ? "venda":"compra"), "BE",  syminfo.ticker, syminfo.prefix, timeframe.period,   trailNow_eff, na, na, trailNow_eff,    qtyEff, qtyEff, qtyEff,   tp1PctAdj, 100.0 - tp1PctAdj, _curCode, _horaBase,   _tpR_eff, (opMode=="Backtest"?"backtest":"producao"), VERSION)
+
+// Builder de mensagem para BE/Trail (sempre usa o px passado)
+mk_msg_be(float px) =>
+    string _tipo  = sideEff > 0 ? "venda" : sideEff < 0 ? "compra" : ""
+    float  _rr    = tp1R_calc(tp1R_base_eff)
+    float  _qEff  = qtyEff
+    f_json_4082(     "be_trail", _tipo, "BE",  syminfo.ticker, syminfo.prefix, timeframe.period,  px, na, na, px,  _qEff, _qEff, _qEff,    tp1PctAdj, 100.0 - tp1PctAdj,   _curCode, _horaBase, _rr,  (opMode=="Backtest"?"backtest":"producao"), VERSION)
+
+
+// ===== MANUTENÇÃO (1x após N segundos com posição efetiva) ===== 
+if hasPosEffStrict and not _sentMaint and not na(_entryMs) and (clockMs() - _entryMs >= maintainDelayMs) and _allowAlertNow and okMaintExec
+    alert(_msgMaint, alert.freq_once_per_bar)
+    _sentMaint := true
+    lastSendBar := bar_index
+    canSendNow  := false
+
+if _tp1L
+    alert(_msgTP1L, alert.freq_once_per_bar)
+    lastTp1AlertBarL := bar_index
+    lastSendBar := bar_index
+    canSendNow  := false
+    if not allowOrders
+        _entryQty := safeQty(qtyEff - qTP1_qty, qtyEff, lotStep)
+if _tp1S
+    alert(_msgTP1S, alert.freq_once_per_bar)
+    lastTp1AlertBarS := bar_index
+    lastSendBar := bar_index
+    canSendNow  := false
+    if not allowOrders
+        _entryQty := safeQty(qtyEff - qTP1_qty, qtyEff, lotStep)
+
+// ===== TP2 (ou Runner) =====
+if _tp2L
+    alert(_msgTP2L, alert.freq_once_per_bar)
+    lastTp2AlertBarL := bar_index
+    lastSendBar := bar_index
+    canSendNow  := false
+    _flatLockUntilBar := bar_index + flatlock_bars
+    if not allowOrders
+        if extend_after_tp2
+            _entryAvg := tp2L_eff
+        else
+            _sentEntry := false
+            _entryQty  := na
+            _entryAvg  := na
+            _entrySide := ""
+if _tp2S
+    alert(_msgTP2S, alert.freq_once_per_bar)
+    lastTp2AlertBarS := bar_index
+    lastSendBar := bar_index
+    canSendNow  := false
+    _flatLockUntilBar := bar_index + flatlock_bars
+    if not allowOrders
+        if extend_after_tp2
+            _entryAvg := tp2S_eff
+        else
+            _sentEntry := false
+            _entryQty  := na
+            _entryAvg  := na
+            _entrySide := ""
+
+// ===== STOP =====
+if _slL
+    alert(_msgStopL, alert.freq_once_per_bar)
+    lastStopAlertBarL := bar_index
+    lastSendBar := bar_index
+    canSendNow  := false
+    _flatLockUntilBar := bar_index + flatlock_bars
+    if not allowOrders
+        _sentEntry := false
+        _entryQty  := na
+        _entryAvg  := na
+        _entrySide := ""
+if _slS
+    alert(_msgStopS, alert.freq_once_per_bar)
+    lastStopAlertBarS := bar_index
+    lastSendBar := bar_index
+    canSendNow  := false
+    _flatLockUntilBar := bar_index + flatlock_bars
+    if not allowOrders
+        _sentEntry := false
+        _entryQty  := na
+        _entryAvg  := na
+        _entrySide := ""
+
+// ===== Runner (estratégia) — se habilitado, após TP2 trava stop no TP2 =====
+if allowOrders and extend_after_tp2 and hasPosEffStrict and qtyEffOk
+    if sideEff>0 and not na(tp2L_eff) and high>=tp2L_eff and okStopFinal
+        strategy.exit(ID_LE_SL, from_entry=ID_LE, stop=tp2L_eff)
+    if sideEff<0 and not na(tp2S_eff) and low<=tp2S_eff and okStopFinal
+        strategy.exit(ID_SE_SL, from_entry=ID_SE, stop=tp2S_eff)
+
+// Memória runner
+var bool runnerArmedL = false
+var bool runnerArmedS = false
+
+// Armar runner quando TP2 for atingido (modo Produção/Indicador use as flags dos alerts; no strategy use preço)
+if extend_after_tp2 and strategy.position_size > 0 and not na(tp2L) and high >= tp2L
+    runnerArmedL := true
+if extend_after_tp2 and strategy.position_size < 0 and not na(tp2S) and low  <= tp2S
+    runnerArmedS := true
+
+// Exit do runner: trava stop em TP2 (sem alvo)
+if allowOrders
+    if runnerArmedL and strategy.position_size > 0
+        strategy.exit("LE_RUN", from_entry=ID_LE, stop=tp2L)
+    if runnerArmedS and strategy.position_size < 0
+        strategy.exit("SE_RUN", from_entry=ID_SE, stop=tp2S)
+
+// Capturar idade da posição (sem reset por parcial/addon)
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    posEntryBar := na
+else if strategy.position_size != 0 and strategy.position_size[1] == 0
+    posEntryBar := bar_index
+
+if _sideEffNow != _lastSide
+    _sentMaint := false
+_lastSide := _sideEffNow
+
+
+// Ajuste de TP1% para respeitar passo do lote no momento da execução (opcional)
+if strictLotOnExits and posQtyAbs > 0 and tp1PctEff > 0
+    float targetQ = round_to_step(posQtyAbs * (tp1PctEff/100.0), lotStep)
+    targetQ := clampf(targetQ, 0.0, posQtyAbs)
+    tp1PctAdj := posQtyAbs == 0 ? 0.0 : (targetQ / posQtyAbs) * 100.0
+
+if allowOrders and okStopExec and okHoldStop
+    strategy.exit(ID_LE_SL,  from_entry=ID_LE, stop=stopLong)
+    strategy.exit(ID_SE_SL,  from_entry=ID_SE, stop=stopShort)
+
+// ===== MEMÓRIA DE ALERTAS (declare uma única vez no script) ====
+var int lastAlertBarL     = -1
+var int lastAlertBarS     = -1
+var int lastAlertAnyBar = -1
+
+// limpar quando abre posição nova OU virou o dia
+if (strategy.position_size != 0 and strategy.position_size[1] == 0) or (ta.change(time("D")) != 0)
+    _flatLockUntilBar := -1
+
+// Anti-colisão de código no dia
+var string _lastCodeSentToday = ""
+// Disparar 1x a manutenção de fechamento
+var bool _sentCloseMaint = false
+
+if ta.change(time("D"))!=0
+    _seqToday:=0
+    _lastCodeSentToday := ""   // <- add esta linha
+
+// === 'tipo' para a CHAVE: sempre a direção da ENTRADA ===
+if allowOrders
+    if strategy.position_size > 0
+        sideKey := 1
+    else
+        if strategy.position_size < 0
+            sideKey := -1
+        else
+            sideKey := 0
+else
+    if _entrySide == "LONG"
+        sideKey := 1
+    else
+        if _entrySide == "SHORT"
+            sideKey := -1
+        else
+            sideKey := 0
+
+if candL and longReady
+    _lastMeth := pickMethL
+if candS and shortReady
+    _lastMeth := pickMethS
+if (_slL or _slS) and (_lastMeth == "BOSCont")
+    bos_failDay := bos_failDay + 1
+
+float _posQ = math.abs(strategy.position_size)
+float _qTP1  = round_to_step(_posQ * (tp1PctAdj/100.0), lotStep)
+float _qTP2  = round_to_step(_posQ * math.max(0.0, (100.0 - tp1PctAdj)/100.0), lotStep)
+float _qRemTP1 = round_to_step(math.max(_posQ - _qTP1, 0), lotStep)
+float _qRemTP2 = round_to_step(math.max(_posQ - _qTP1 - _qTP2, 0), lotStep)
+
+float _qRemTP1_eff= round_to_step(math.max(_posQ_eff - _qTP1_eff, 0), lotStep)
+float _qRemTP2_eff= round_to_step(math.max(_posQ_eff - _qTP1_eff - _qTP2_eff, 0), lotStep)
+
+if qTP2_qty < lotStep
+    qTP2_qty := 0.0
+    qTP1_qty := safeQty(_posQ_eff, _posQ_eff, lotStep)
+
+// Espelhos que o JSON usa
+g_tp1_qty := qTP1_qty
+g_tp2_qty := qTP2_qty
+
+// LONG
+if allowOrders and useTP1 and qTP1_qty > 0 and okTP1Exec and okTPBEFinal and not na(tp1L) and strategy.position_size > 0
+    strategy.exit("TP1", from_entry="L", qty=f_takeProfit(true, 1), limit=tp1ProjL)
+if allowOrders and useTP2 and qTP2_qty > 0 and okTPBEFinal and not na(tp2L) and strategy.position_size > 0
+    strategy.exit("TP2", from_entry="L", qty=f_takeProfit(true, 2), limit=tp2ProjL)
+// SHORT
+if allowOrders and useTP1 and qTP1_qty > 0 and okTP1Exec and okTPBEFinal and not na(tp1S) and strategy.position_size < 0
+    strategy.exit("TP1", from_entry="S", qty=f_takeProfit(false, 1), limit=tp1ProjS)
+if allowOrders and useTP2 and qTP2_qty > 0 and okTPBEFinal and not na(tp2S) and strategy.position_size < 0   
+    strategy.exit("TP2", from_entry="S", qty=f_takeProfit(false, 2), limit=tp2ProjS)
+
+// ===================== RUNNER PÓS-TP2 (stop promovido) =====================
+bool runnerEligible = hasPosEffStrict and qtyEffOk and okBEExec and okTPBEFinal and (sideEff != 0)
+float tp2L_eff_local = tp2L_eff
+float tp2S_eff_local = tp2S_eff
+
+bool crossedTP2 =
+     (sideEff > 0 and useTP2 and not na(tp2L_eff_local) and high >= tp2L_eff_local) or
+     (sideEff < 0 and useTP2 and not na(tp2S_eff_local) and low  <= tp2S_eff_local)
+
+// Calcula SEMPRE o candidato de promoção e a mensagem (evita warning)
+float runnerStopCand =
+     sideEff > 0 ? tp2L_eff_local :
+     sideEff < 0 ? tp2S_eff_local : na
+
+float bePxEffL_runner = avgEff + beOffsetATRx * atr14
+float bePxEffS_runner = avgEff - beOffsetATRx * atr14
+float trailNow_runner = na
+if sideEff > 0
+    trailNow_runner := math.max(bePxEffL_runner, avgEff + trailATRx*atr14)
+else if sideEff < 0
+    trailNow_runner := math.min(bePxEffS_runner, avgEff - trailATRx*atr14)
+
+float promotedStop_all = na
+if sideEff > 0
+    promotedStop_all := na(runnerStopCand) ? trailNow_runner : math.max(runnerStopCand, trailNow_runner)
+else if sideEff < 0
+    promotedStop_all := na(runnerStopCand) ? trailNow_runner : math.min(runnerStopCand, trailNow_runner)
+
+// Mensagem pré-calculada em TODA barra
+string msgBE_runner = mk_msg_be(promotedStop_all)
+
+// Gatilho do envio
+bool canSendBE_runner = runnerEligible and crossedTP2 and (canSendNow or (allowSameBarBE and (bar_index != lastBEAlertBar)))
+
+if canSendBE_runner
+    alert(msgBE_runner, alert.freq_once_per_bar)
+    be_lastTrailPx := promotedStop_all
+    lastBEAlertBar := bar_index
+    lastSendBar    := bar_index
+    canSendNow     := false
+// =================== FIM RUNNER PÓS-TP2 =====================
+
+// -------------------- ALERTAS DE BE/TRAIL (robusto) --------------------------
+string beAlert_stepMode = input.string("Ticks", "BE/Trail: critério do 'aperto'", options=["Ticks","PctEntryNow"], group=gpExit)
+int   beAlert_minTicks  = input.int(2, "Aperto mín. p/ novo alerta (em ticks)", minval=1, group=gpExit)
+float beAlert_minPct    = input.float(1.0, "Aperto mín. p/ novo alerta (% de |Entrada−Preço atual|)", minval=0.1, step=0.1, group=gpExit)
+bool  beAlert_oncePerBar = input.bool(true, "BE/Trail: no máx. 1 alerta por barra", group=gpExit)
+
+// Estado por lado para resetar trilha
+var int be_lastSide = 0
+
+// Reset quando zera ou troca de lado
+if (sideEff == 0) or (sideEff != be_lastSide)
+    be_lastTrailPx := na
+    be_lastSide    := sideEff
+
+// Elegibilidade do alerta
+bool beElig = hasPosEffStrict and qtyEffOk and okBEExec and okTPBEFinal and (posAge >= minHoldBars or (high>=tp1L or low<=tp1S)) and (sideEff != 0)
+
+// Limiar de “aperto” para novo alerta
+float _deltaTicks = beAlert_minTicks * syminfo.mintick
+float _deltaPct   = (beAlert_minPct/100.0) * math.abs(avgEff - close)
+float _delta      = beAlert_stepMode == "Ticks" ? _deltaTicks : _deltaPct
+_delta := math.max(_delta, syminfo.mintick)
+
+// Ficou mais apertado que o último alertado?
+bool tighter = false
+if not na(trailNow_eff)
+    if sideEff > 0
+        tighter := na(be_lastTrailPx) or (trailNow_eff >= be_lastTrailPx + _delta)
+    else if sideEff < 0
+        tighter := na(be_lastTrailPx) or (trailNow_eff <= be_lastTrailPx - _delta)
+
+// Respeita 1×/barra (local e global), com exceção opcional
+bool canSendBE = beElig and tighter
+canSendBE := canSendBE and (not beAlert_oncePerBar or bar_index != lastBEAlertBar)
+canSendBE := canSendBE and (canSendNow or (allowSameBarBE and bar_index != lastBEAlertBar))
+
+if canSendBE
+    alert(_msgBE_now,alert.freq_once_per_bar)
+    be_lastTrailPx := trailNow_eff
+    lastBEAlertBar := bar_index
+    lastSendBar    := bar_index
+    canSendNow     := false
+
+// Reset quando zera ou troca de lado
+if (sideEff == 0) or (sideEff != be_lastSide)
+    be_lastTrailPx := na
+    be_lastSide    := sideEff
+
+// -------------------- Elegibilidade (mesma lógica de BE/Trail) ---------------
+bool beAlert_OK = okBEExec and (posAge >= minHoldBars or (high>=tp1L or low<=tp1S)) and hasPosEffStrict and qtyEffOk
+bool canAlertThisBar = sameBarEntries ? true : (bar_index != lastAlertAnyBar)
+// Preços BE/Trail "efetivos"
+float trailNowL   = math.max(bePxEffL, avgEff + trailATRx*atr14)
+float trailNowS   = math.min(bePxEffS, avgEff - trailATRx*atr14)
+float trailNow    = sideEff>0 ? trailNowL : sideEff<0 ? trailNowS : na
+
+float deltaTrail  = na(be_lastTrailPx) ? na : math.abs(trailNow - be_lastTrailPx)
+float stepMin     = beAlert_stepMode == "Ticks" ? beAlert_minTicks * syminfo.mintick : ((math.abs(close - avgEff) > 0) ? (beAlert_minPct/100.0) * math.abs(close - avgEff) : na)
+bool improved =
+     (sideEff > 0 and not na(trailNow) and (na(be_lastTrailPx) or trailNow >  be_lastTrailPx)) or
+     (sideEff < 0 and not na(trailNow) and (na(be_lastTrailPx) or trailNow <  be_lastTrailPx))
+bool stepEnough = na(stepMin) or na(deltaTrail) ? true : (deltaTrail >= stepMin)
+
+// --------------- Gatilho final (respeita exceção controlada) -----------------
+bool fireBE = beAlert_OK and (sideEff != 0) and not na(trailNow)
+fireBE := fireBE and (na(be_lastTrailPx) or (improved and stepEnough))
+
+bool canSendBE_now = canSendNow or (allowSameBarBE and (lastSendBar == bar_index))
+fireBE := fireBE and (not beAlert_oncePerBar or (bar_index != lastBEAlertBar)) and (not flatLocked) and canSendBE_now
+
+if fireBE
+    string _tipo  = sideEff > 0 ? "venda" : "compra"
+    float  _qEff  = qtyEff
+    alert(_msgBE_now,alert.freq_once_per_bar_close)
+    be_lastTrailPx := trailNow
+    lastBEAlertBar := bar_index
+    lastSendBar    := bar_index
+    canSendNow     := false
+
+if allowOrders and useDayFlat and timeToFlat and strategy.position_size != 0
+    strategy.cancel(ID_LE_TP1)
+    strategy.cancel(ID_LE_TP2)
+    strategy.cancel(ID_SE_TP1)
+    strategy.cancel(ID_SE_TP2)
+    strategy.cancel(ID_LE_SL)
+    strategy.cancel(ID_SE_SL)
+    strategy.close_all("Flat end of session")
+
+bool flatEff = allowOrders ? (strategy.position_size == 0) : (not hasPosEff)
+// ficou flat agora (e havia uma posição/alerta ativo)?
+bool justWentFlat =
+     flatEff and (
+         allowOrders ? (strategy.position_size[1] != 0)
+                     : (_sentEntry or not na(_entryMs))
+     )
+
+// emite 1x uma manutenção confirmando que zerou (qtd=0)
+if justWentFlat and not _sentCloseMaint and _curCode != ""
+    alert(_msgMaint,alert.freq_once_per_bar)
+    _sentCloseMaint := true
+
+if flatEff
+    _sentEntry := false
+    _sentMaint := false
+    _entryMs := na
+    _entryQty := na
+    _entrySide := ""
+    _curCode := ""
+
+string _metodo = ""
+if strategy.position_size > 0
+    _metodo := (pickMethL != "" ? pickMethL : "core")
+else
+    if strategy.position_size < 0
+        _metodo := (pickMethS != "" ? pickMethS : "core")
+    else
+        _metodo := (pickMethL != "" ? pickMethL : pickMethS)
+if _metodo == ""
+    _metodo := "core"
+string _metodoSafe = _metodo
+
+string _ativo = syminfo.ticker
+string _exch  = syminfo.prefix
+string _tf    = timeframe.period
+string _ver   = VERSION
+string _codigo = _entrySide + "_" + str.tostring(bar_index)
+
+float _avg = strategy.position_size == 0 ? close : strategy.position_avg_price
+
+float _tp1 = na
+float _tp2 = na
+float _sl  = na
+if strategy.position_size > 0
+    _tp1 := tp1L
+    _tp2 := tp2L
+    _sl  := stopLong
+else
+    if strategy.position_size < 0
+        _tp1 := tp1S
+        _tp2 := tp2S
+        _sl  := stopShort
+
+float _rr = tp1R_calc(tp1R_base_eff)
+// Empate também para o modo Indicador (quando allowOrders==false)
+bool allowCoreL_once = allowCoreL
+bool allowCoreS_once = allowCoreS
+
+if allowCoreL_once and allowCoreS_once
+    float scL_core = hasMethL ? pickScL : na
+    float scS_core = hasMethS ? pickScS : na
+    bool chooseL_core = na(scS_core) or (not na(scL_core) and scL_core >= scS_core)
+    if chooseL_core
+        allowCoreS_once := false
+    else
+        allowCoreL_once := false
+
+// ===== ALERTA DE ENTRADA POR SINAL (não depende de fill) =====
+bool coreOK_alert = coreMaskCore
+bool fireL = (not hasPosEff) and allowCoreL_once and coreMaskCore and (bar_index != lastAlertBarL) and canSendNow and canAlertThisBar and (qL_send > 0) and ((not mg_use) or gainOK_L) and ((not rr_use) or rrOK) and ((not useScoreCut) or passScoreL) and not flatLocked and okEntryExec
+bool fireS = (not hasPosEff) and allowCoreS_once and coreMaskCore and (bar_index != lastAlertBarS) and canSendNow and canAlertThisBar and (qS_send > 0) and ((not mg_use) or gainOK_S) and ((not rr_use) or rrOK) and ((not useScoreCut) or passScoreS) and not flatLocked and okEntryExec
+
+// desempate
+if fireL and fireS
+    bool chooseL_alert = na(pickScS) or (not na(pickScL) and pickScL >= pickScS)
+    if chooseL_alert
+        fireS := false
+    else
+        fireL := false
+
+if fireL
+    g_tp1_px  := tp1L
+    g_tp2_px  := tp2L
+    g_tp1_qty := round_to_step(qL_send * (tp1PctAdj/100.0), lotStep)
+    g_tp2_qty := useTP2 ? round_to_step(math.max(qL_send - g_tp1_qty, 0.0), lotStep) : na
+    _seqToday += 1
+    mark_send()
+    _curCode := build_code_from_ms(_lastSendMs)
+    if _curCode == _lastCodeSentToday
+        _seqToday += 1
+        _curCode  := build_code()
+    alert(_msgEntryL,alert.freq_once_per_bar)
+    lastAlertBarL := bar_index
+    lastAlertAnyBar := bar_index
+    lastEntryBar := bar_index
+    lastSendBar  := bar_index
+    _sentEntry := true
+    _entryMs := clockMs()
+    _entryQty := qL_send
+    _entrySide := "LONG"
+    _sentCloseMaint := false
+    _lastCodeSentToday := _curCode
+    canSendNow   := false
+    if not allowOrders
+        _entryAvg := close
+        posEntryBar := bar_index
+        array.push(entryTimes, int(time))
+        tradesToday += 1
+
+if fireS
+    g_tp1_px  := tp1S
+    g_tp2_px  := tp2S
+    g_tp1_qty := round_to_step(qS_send * (tp1PctAdj/100.0), lotStep)
+    g_tp2_qty := useTP2 ? round_to_step(math.max(qS_send - g_tp1_qty, 0.0), lotStep) : na
+    _seqToday += 1
+    mark_send()
+    _curCode := build_code_from_ms(_lastSendMs)
+    if _curCode == _lastCodeSentToday
+        _seqToday += 1
+        mark_send()
+        _curCode := build_code_from_ms(_lastSendMs)
+    alert(_msgEntryS,alert.freq_once_per_bar)
+    lastAlertBarS := bar_index
+    lastAlertAnyBar := bar_index
+    lastEntryBar := bar_index
+    lastSendBar  := bar_index
+    _sentEntry := true
+    _entryMs := clockMs()
+    _entryQty := qS_send
+    _entrySide := "SHORT"
+    _sentCloseMaint := false
+    _lastCodeSentToday := _curCode
+    canSendNow   := false
+    if not allowOrders
+        _entryAvg := close
+        posEntryBar := bar_index
+        array.push(entryTimes, int(time))
+        tradesToday += 1
+
+if _openedNow
+    _entryQty := math.abs(strategy.position_size)
+    _entrySide := strategy.position_size > 0 ? "LONG" : "SHORT"
+
+if ta.change(time("D")) != 0
+    _sentEntry := false
+    _sentMaint := false
+    _entryMs   := na
+    _entryQty  := na
+    _entryAvg  := na
+    _entrySide := ""
+    _curCode   := ""
+    _sentCloseMaint := false
+
+// -----------------------------------------------------------------------------
+// ⑬ Visual / HUD e Diagnóstico
+// -----------------------------------------------------------------------------
+plot(ema200, title="EMA200", color=color.new(color.gray, 0), linewidth=2)
+plot(ema20,  title="EMA20",  color=color.new(color.blue, 0), linewidth=1)
+plot(vwap,   title="VWAP",   color=color.new(color.orange,0), linewidth=1)
+plotchar(sigInsideL, title="Inside L", char="^", location=location.belowbar, color=color.new(color.teal,0),   size=size.tiny)
+plotchar(sigInsideS, title="Inside S", char="v", location=location.abovebar, color=color.new(color.red,0),    size=size.tiny)
+plotchar(sigDonL,    title="Don L",    char="^", location=location.belowbar, color=color.new(color.green,0),  size=size.tiny)
+plotchar(sigDonS,    title="Don S",    char="v", location=location.abovebar, color=color.new(color.maroon,0), size=size.tiny)
+plotchar(sigContL,   title="Cont L",   char="^", location=location.belowbar, color=color.new(color.aqua,0),   size=size.tiny)
+plotchar(sigContS,   title="Cont S",   char="v", location=location.abovebar, color=color.new(color.purple,0), size=size.tiny)
+plotchar(sigORL,     title="OR L",     char="^", location=location.belowbar, color=color.new(color.navy,0),   size=size.tiny)
+plotchar(sigORS,     title="OR S",     char="v", location=location.abovebar, color=color.new(color.fuchsia,0),size=size.tiny)
+
+// Diagnóstico: por que não entrou?
+plotshape((pickMethL != "" and coreMask and not (qtyL > 0)) or (pickMethS != "" and coreMask and not (qtyS > 0)),
+     title="Sem Qtd", style=shape.xcross, location=location.bottom, color=color.red, size=size.tiny, text="qty=0")
+plotshape(((pickMethL != "") or (pickMethS != "")) and coreMask and (not passScoreL and not passScoreS),
+     title="Score bloqueou", style=shape.triangledown, location=location.bottom, color=color.orange, size=size.tiny, text="score")
+plotshape(((pickMethL != "") or (pickMethS != "")) and not coreMask,
+     title="Core bloqueou", style=shape.triangledown, location=location.bottom, color=color.gray, size=size.tiny, text="core")
+plotshape(((pickMethL != "" and qtyL > 0 and not gainOK_L) or (pickMethS != "" and qtyS > 0 and not gainOK_S)),
+     title="Ganho mínimo bloqueou", style=shape.triangledown, location=location.bottom, color=color.new(color.blue,0), size=size.tiny, text="minGain")
