@@ -2351,7 +2351,6 @@ if not na(_qPrevS)
 _qPrevL := qtyL
 _qPrevS := qtyS
 
-
 // ----------------------------------------------------------------------------
 // ⑩ Guard-rail: ganho mínimo projetado (TPs)
 // -----------------------------------------------------------------------------
@@ -2366,8 +2365,8 @@ f_takeProfit(bool isLong, int level) =>
     useTP = level == 1 ? useTP1 : useTP2
     useTP ? round_to_step(qty * pct / 100, lotStep) : 0.0
 
-float gainProjL = (tp1ProjL ? f_takeProfit(true, 1) * tp1ProjL : 0.0) +  (tp2ProjL ? f_takeProfit(true, 2) * tp2ProjL : 0.0)
-float gainProjS = (tp1ProjS ? f_takeProfit(false, 1) * tp1ProjS : 0.0) +  (tp2ProjS ? f_takeProfit(false, 2) * tp2ProjS : 0.0)
+float gainProjL = (tp1ProjL > 0 ? f_takeProfit(true, 1) * tp1ProjL : 0.0)
+float gainProjS = (tp1ProjS > 0 ? f_takeProfit(false, 1) * tp1ProjS : 0.0)
 
 // === PATCH E: Slippage-aware ===
 string gpSlip = "②.d Execução & Slippage"
